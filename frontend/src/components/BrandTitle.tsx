@@ -1,9 +1,20 @@
-import { useId } from "react";
+"use client";
 
-// "Jaadoo Pizza Project" with the signboard's golden sparkles over "Jaadoo".
-// Pass font size, weight and colour through className; the sparkles scale with the text.
-export default function BrandTitle({ className = "" }: { className?: string }) {
+import { useId } from "react";
+import { useTenantProfile } from "@/components/TenantThemeProvider";
+
+// Dynamic BrandTitle with golden sparkles; defaults to active tenant or Jaadoo Pizza Project
+export default function BrandTitle({
+  className = "",
+  title,
+}: {
+  className?: string;
+  title?: string;
+}) {
   const gradientId = useId();
+  const { tenant } = useTenantProfile();
+  const displayTitle = title || tenant?.name || "Jaadoo Pizza Project";
+
   // Strip out font-serif/font-sans overrides to guarantee unified Poppins Bold branding across all portals
   const cleanedClass = className.replace(/font-serif/g, "").replace(/font-sans/g, "");
   return (
@@ -25,7 +36,7 @@ export default function BrandTitle({ className = "" }: { className?: string }) {
           <path d="M62 116 C63.6 135.5 66 139.4 78 142 C66 144.6 63.6 148.5 62 168 C60.4 148.5 58 144.6 46 142 C58 139.4 60.4 135.5 62 116Z" />
         </g>
       </svg>
-      Jaadoo Pizza Project
+      {displayTitle}
     </span>
   );
 }

@@ -45,6 +45,11 @@ async def get_order(
                     u_res = await db.execute(select(User).where(User.id == int(uid), User.is_active == True))
                     user = u_res.scalar_one_or_none()
                     if user:
+                        if user.tenant_id != order.tenant_id:
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Access denied: Cannot access an order belonging to another tenant.",
+                            )
                         role = getattr(user, "role", None)
                         if not role and user.role_id:
                             r_res = await db.execute(select(Role).where(Role.id == user.role_id))
@@ -57,6 +62,8 @@ async def get_order(
                             perms = (await db.execute(q)).scalars().all()
                             if "pos:access" in perms:
                                 return order
+        except HTTPException:
+            raise
         except Exception:
             pass
 

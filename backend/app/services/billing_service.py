@@ -133,7 +133,9 @@ class BillingService:
         net_due = max(gross_total - reservation_credit, Decimal("0.00"))
 
         if not bill:
+            tbl_res = await db.get(Table, dining_session.table_id)
             bill = Bill(
+                tenant_id=tbl_res.tenant_id if tbl_res else None,
                 dining_session_id=dining_session_id,
                 subtotal=calc_subtotal,
                 tax_amount=calc_tax,
@@ -170,11 +172,21 @@ class BillingService:
         discount_value: Decimal,
         reason: str | None,
         user_id: int | None,
+        tenant_id=None,
     ) -> Bill:
         """Set (or clear, with discount_type=None) the discount on an open session's bill."""
         dining_session = await db.get(DiningSession, dining_session_id)
         if not dining_session:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Dining session #{dining_session_id} not found.")
+
+        if tenant_id:
+            table = await db.get(Table, dining_session.table_id)
+            if not table or str(table.tenant_id) != str(tenant_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied: Cannot apply discount to another café's dining session.",
+                )
+
         if dining_session.status not in ("OPENED", "ACTIVE", "CHECKOUT"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="DISCOUNT_LOCKED: This bill is already settled.")
 

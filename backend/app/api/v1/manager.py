@@ -110,6 +110,7 @@ async def get_manager_overview(
     paid_bills_q = (
         select(Bill)
         .where(
+            Bill.tenant_id == current_user.tenant_id,
             Bill.created_at >= start_utc,
             Bill.created_at < end_exclusive_utc,
             Bill.is_paid == True,
@@ -133,6 +134,7 @@ async def get_manager_overview(
     prior_paid_bills_q = (
         select(Bill)
         .where(
+            Bill.tenant_id == current_user.tenant_id,
             Bill.created_at >= prior_start_utc,
             Bill.created_at < prior_end_exclusive_utc,
             Bill.is_paid == True,
@@ -152,7 +154,9 @@ async def get_manager_overview(
     # 2. Payments & Verified Collections
     payments_q = (
         select(Payment)
+        .join(Bill, Payment.bill_id == Bill.id)
         .where(
+            Bill.tenant_id == current_user.tenant_id,
             Payment.created_at >= start_utc,
             Payment.created_at < end_exclusive_utc,
         )
@@ -183,6 +187,7 @@ async def get_manager_overview(
     vbc_q = (
         select(VerifiedBankCredit)
         .where(
+            VerifiedBankCredit.tenant_id == current_user.tenant_id,
             VerifiedBankCredit.verified_at >= start_utc,
             VerifiedBankCredit.verified_at < end_exclusive_utc,
         )
@@ -225,6 +230,7 @@ async def get_manager_overview(
         select(PurchaseOrder)
         .options(selectinload(PurchaseOrder.supplier))
         .where(
+            PurchaseOrder.tenant_id == current_user.tenant_id,
             or_(
                 and_(
                     PurchaseOrder.invoice_date.isnot(None),
@@ -264,6 +270,7 @@ async def get_manager_overview(
     unpaid_bills_q = (
         select(Bill)
         .where(
+            Bill.tenant_id == current_user.tenant_id,
             Bill.created_at >= start_utc,
             Bill.created_at < end_exclusive_utc,
             Bill.is_paid == False,
@@ -277,6 +284,7 @@ async def get_manager_overview(
     res_q = (
         select(Reservation)
         .where(
+            Reservation.tenant_id == current_user.tenant_id,
             Reservation.reservation_date >= start,
             Reservation.reservation_date <= end,
         )
@@ -408,6 +416,7 @@ async def get_manager_analytics(
     bills_q = (
         select(Bill)
         .where(
+            Bill.tenant_id == current_user.tenant_id,
             Bill.created_at >= start_utc,
             Bill.created_at < end_exclusive_utc,
             Bill.is_paid == True,
@@ -418,7 +427,9 @@ async def get_manager_analytics(
     # 2. Fetch Payments for the date range
     payments_q = (
         select(Payment)
+        .join(Bill, Payment.bill_id == Bill.id)
         .where(
+            Bill.tenant_id == current_user.tenant_id,
             Payment.created_at >= start_utc,
             Payment.created_at < end_exclusive_utc,
         )
@@ -430,6 +441,7 @@ async def get_manager_analytics(
         select(PurchaseOrder)
         .options(selectinload(PurchaseOrder.supplier))
         .where(
+            PurchaseOrder.tenant_id == current_user.tenant_id,
             or_(
                 and_(
                     PurchaseOrder.invoice_date.isnot(None),
@@ -526,6 +538,7 @@ async def get_manager_analytics(
         .join(Order, OrderItem.order_id == Order.id)
         .outerjoin(MenuCategory, MenuItem.category_id == MenuCategory.id)
         .where(
+            Order.tenant_id == current_user.tenant_id,
             Order.created_at >= start_utc,
             Order.created_at < end_exclusive_utc,
             Order.status.in_(["SERVED", "COMPLETED", "DELIVERED", "CONFIRMED"]),
@@ -551,6 +564,7 @@ async def get_manager_analytics(
         select(Supplier.name, func.sum(PurchaseOrder.total_cost).label("total_cost"), func.count(PurchaseOrder.id).label("po_count"))
         .join(PurchaseOrder, PurchaseOrder.supplier_id == Supplier.id)
         .where(
+            PurchaseOrder.tenant_id == current_user.tenant_id,
             or_(
                 and_(
                     PurchaseOrder.invoice_date.isnot(None),
@@ -582,6 +596,7 @@ async def get_manager_analytics(
     res_analytics_q = (
         select(Reservation.status, func.count(Reservation.id).label("count"), func.sum(Reservation.guest_count).label("guests"))
         .where(
+            Reservation.tenant_id == current_user.tenant_id,
             Reservation.reservation_date >= start,
             Reservation.reservation_date <= end,
         )
@@ -625,8 +640,9 @@ async def get_manager_payments(
 
     start_utc, end_exclusive_utc = ist_date_to_utc_bounds(start, end)
 
-    # Base query on Payment
+    # Base query on Payment scoped to current tenant via Bill
     conditions = [
+        Bill.tenant_id == current_user.tenant_id,
         Payment.created_at >= start_utc,
         Payment.created_at < end_exclusive_utc,
     ]
@@ -645,12 +661,13 @@ async def get_manager_payments(
         )
 
     # Count total
-    count_q = select(func.count(Payment.id)).where(*conditions)
+    count_q = select(func.count(Payment.id)).join(Bill, Payment.bill_id == Bill.id).where(*conditions)
     total_count = (await db.execute(count_q)).scalar() or 0
 
     # Paged items
     items_q = (
         select(Payment)
+        .join(Bill, Payment.bill_id == Bill.id)
         .options(selectinload(Payment.bill).selectinload(Bill.dining_session))
         .where(*conditions)
         .order_by(desc(Payment.created_at))
@@ -663,7 +680,10 @@ async def get_manager_payments(
     refs = [p.transaction_reference.strip().lower() for p in payments if p.transaction_reference]
     vbc_map = {}
     if refs:
-        vbc_q = select(VerifiedBankCredit).where(func.lower(VerifiedBankCredit.utr).in_(refs))
+        vbc_q = select(VerifiedBankCredit).where(
+            VerifiedBankCredit.tenant_id == current_user.tenant_id,
+            func.lower(VerifiedBankCredit.utr).in_(refs),
+        )
         for v in (await db.execute(vbc_q)).scalars().all():
             vbc_map[v.utr.strip().lower()] = v
 
@@ -694,7 +714,9 @@ async def get_manager_payments(
     # Summary totals for the filtered range
     total_paid_res = (
         await db.execute(
-            select(func.coalesce(func.sum(Payment.amount_paid), Decimal("0.00"))).where(*conditions)
+            select(func.coalesce(func.sum(Payment.amount_paid), Decimal("0.00")))
+            .join(Bill, Payment.bill_id == Bill.id)
+            .where(*conditions)
         )
     ).scalar() or Decimal("0.00")
 

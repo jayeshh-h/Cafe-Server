@@ -1,6 +1,8 @@
 import datetime
 from decimal import Decimal
+import uuid
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 from app.utils.helpers import utc_now
@@ -10,6 +12,13 @@ class Bill(Base):
     __tablename__ = "bills"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        default=uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210"),
+        nullable=False,
+        index=True,
+    )
     dining_session_id: Mapped[int] = mapped_column(Integer, ForeignKey("dining_sessions.id", ondelete="CASCADE"), nullable=False)
     subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     tax_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
@@ -29,6 +38,7 @@ class Bill(Base):
 
     dining_session = relationship("DiningSession", back_populates="bills")
     payments = relationship("Payment", back_populates="bill", cascade="all, delete-orphan")
+    tenant = relationship("Tenant", foreign_keys=[tenant_id])
 
 
 class Payment(Base):

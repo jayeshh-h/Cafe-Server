@@ -26,12 +26,29 @@ engine = create_async_engine(TEST_DATABASE_URL, echo=False, connect_args=connect
 TestingSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
 
+import uuid
+from app.models.tenant import Tenant
+
+DEFAULT_TENANT_ID = uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
+
+
 @pytest_asyncio.fixture(scope="function")
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     async with TestingSessionLocal() as session:
+        default_tenant = Tenant(
+            id=DEFAULT_TENANT_ID,
+            name="Restrova Default",
+            slug="restrova-default",
+            custom_domain="localhost",
+            subscription_status="ACTIVE",
+            plan_tier="ENTERPRISE",
+            primary_color="#2B1810",
+        )
+        session.add(default_tenant)
+        await session.commit()
         yield session
 
     async with engine.begin() as conn:
@@ -48,7 +65,14 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
         yield db_session
 
     async def override_get_current_user():
-        return User(id=1, username="test_cashier", email="cashier@example.com", is_active=True, role=Role(id=1, name="Admin"))
+        return User(
+            id=1,
+            tenant_id=DEFAULT_TENANT_ID,
+            username="test_cashier",
+            email="cashier@example.com",
+            is_active=True,
+            role=Role(id=1, name="Admin"),
+        )
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = override_get_current_user

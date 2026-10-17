@@ -141,6 +141,7 @@ class OrderService:
                                 order_number = f"ORD-{date_prefix}-{order_seq:03d}"
 
                         order = Order(
+                            tenant_id=table.tenant_id if table else None,
                             dining_session_id=dining_session.id,
                             order_number=order_number,
                             status="CONFIRMED",
@@ -181,6 +182,7 @@ class OrderService:
                     }.get(raw_name.lower(), raw_name.lower())
 
                     name_query = select(MenuItem).where(
+                        MenuItem.tenant_id == table.tenant_id if table else None,
                         func.lower(func.trim(MenuItem.name)) == alias_target,
                         MenuItem.is_active == True,
                         MenuItem.is_available == True,
@@ -191,6 +193,7 @@ class OrderService:
                 # 2. Fallback to menu_item_id lookup if not matched by name
                 if not menu_item and item_data.menu_item_id:
                     menu_query = select(MenuItem).where(
+                        MenuItem.tenant_id == table.tenant_id if table else None,
                         MenuItem.id == item_data.menu_item_id,
                         MenuItem.is_active == True,
                         MenuItem.is_available == True,
@@ -363,6 +366,13 @@ class OrderService:
             # Broadcast WebSocket events to POS and Kitchen
             from app.api.websocket import ws_manager
             from app.workers.celery_app import celery_app
+            from app.models.tenant import Tenant
+
+            tenant_slug = None
+            if table and table.tenant_id:
+                t_obj = await db.get(Tenant, table.tenant_id)
+                if t_obj:
+                    tenant_slug = t_obj.slug
 
             await ws_manager.broadcast("pos", {
                 "event": "KOT_CREATED",
@@ -374,14 +384,14 @@ class OrderService:
                 "printed_status": kot.printed_status,
                 "allergy_info": kot.allergy_info,
                 "created_at": kot.created_at.isoformat(),
-            })
+            }, tenant_slug=tenant_slug)
 
             for k_order in created_kitchen_orders:
                 await ws_manager.broadcast("kitchen", {
                     "event": "KITCHEN_ORDER_CREATED",
                     "kitchen_id": k_order.kitchen_id,
                     "kitchen_order_id": k_order.id
-                })
+                }, tenant_slug=tenant_slug)
             
             # Fire thermal print execution (Never cancels order on failure)
             for print_job in created_print_jobs:

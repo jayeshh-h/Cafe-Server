@@ -17,6 +17,9 @@
 :root {
   --background: #F8F5F0;
   --foreground: #140E0A;
+  --tenant-primary: #2B1810;
+  --tenant-secondary: #F7F4EE;
+  --tenant-accent: #C86D51;
 }
 
 body {

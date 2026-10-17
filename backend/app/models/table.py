@@ -1,5 +1,7 @@
 import datetime
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
+import uuid
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 from app.utils.helpers import utc_now
@@ -9,6 +11,13 @@ class Table(Base):
     __tablename__ = "tables"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        default=uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210"),
+        nullable=False,
+        index=True,
+    )
     branch_id: Mapped[int] = mapped_column(Integer, ForeignKey("branches.id", ondelete="CASCADE"), nullable=False)
     table_number: Mapped[str] = mapped_column(String(20), nullable=False)
     capacity: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
@@ -19,6 +28,7 @@ class Table(Base):
     branch = relationship("Branch", back_populates="tables")
     qr_code = relationship("TableQR", back_populates="table", uselist=False)
     dining_sessions = relationship("DiningSession", back_populates="table")
+    tenant = relationship("Tenant", foreign_keys=[tenant_id])
 
     @property
     def floor_number(self) -> int:

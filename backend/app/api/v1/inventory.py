@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db, require_permission
+from app.models.user import User
 from app.models.inventory import InventoryItem, InventoryTransaction
 from app.models.supplier import PurchaseOrder, PurchaseOrderItem, Supplier
 from app.schemas.inventory import (
@@ -32,24 +33,42 @@ router = APIRouter(
 
 
 @router.get("", response_model=List[InventoryItemResponse])
-async def list_inventory(db: AsyncSession = Depends(get_db)):
-    query = select(InventoryItem).order_by(InventoryItem.name)
+async def list_inventory(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
+):
+    query = (
+        select(InventoryItem)
+        .where(InventoryItem.tenant_id == current_user.tenant_id)
+        .order_by(InventoryItem.name)
+    )
     result = await db.execute(query)
     return result.scalars().all()
 
 
 @router.get("/low-stock", response_model=List[InventoryItemResponse])
-async def list_low_stock(db: AsyncSession = Depends(get_db)):
-    query = select(InventoryItem).where(
-        InventoryItem.current_stock <= InventoryItem.reorder_threshold
+async def list_low_stock(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
+):
+    query = (
+        select(InventoryItem)
+        .where(
+            InventoryItem.tenant_id == current_user.tenant_id,
+            InventoryItem.current_stock <= InventoryItem.reorder_threshold,
+        )
     )
     result = await db.execute(query)
     return result.scalars().all()
 
 
 @router.post("/items", response_model=InventoryItemResponse, status_code=201)
-async def create_inventory_item(data: InventoryItemCreate, db: AsyncSession = Depends(get_db)):
-    item = InventoryItem(**data.model_dump())
+async def create_inventory_item(
+    data: InventoryItemCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
+):
+    item = InventoryItem(**data.model_dump(), tenant_id=current_user.tenant_id)
     db.add(item)
     await db.commit()
     await db.refresh(item)
@@ -57,7 +76,14 @@ async def create_inventory_item(data: InventoryItemCreate, db: AsyncSession = De
 
 
 @router.post("/transactions", response_model=InventoryTransactionResponse, status_code=201)
-async def record_transaction(data: InventoryTransactionCreate, db: AsyncSession = Depends(get_db)):
+async def record_transaction(
+    data: InventoryTransactionCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
+):
+    item = await db.get(InventoryItem, data.inventory_item_id)
+    if not item or item.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=404, detail="Inventory item not found.")
     return await InventoryService.record_transaction(
         db,
         inventory_item_id=data.inventory_item_id,
@@ -68,7 +94,11 @@ async def record_transaction(data: InventoryTransactionCreate, db: AsyncSession 
 
 
 @router.post("/bills/scan", response_model=BillScanDraft)
-async def scan_supplier_bill(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def scan_supplier_bill(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
+):
     """Read a supplier bill photo/PDF and return a draft for review. Saves nothing."""
     if file.content_type not in ALLOWED_BILL_TYPES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Upload a JPG, PNG or PDF of the bill.")
@@ -81,13 +111,23 @@ async def scan_supplier_bill(file: UploadFile = File(...), db: AsyncSession = De
     result = await bill_scan_service.extract_bill(content, file.filename or "bill", file.content_type)
     materials = [
         (m.id, m.name, m.unit_of_measure)
-        for m in (await db.execute(select(InventoryItem).order_by(InventoryItem.name))).scalars().all()
+        for m in (
+            await db.execute(
+                select(InventoryItem)
+                .where(InventoryItem.tenant_id == current_user.tenant_id)
+                .order_by(InventoryItem.name)
+            )
+        ).scalars().all()
     ]
     return bill_scan_service.build_draft(result, materials)
 
 
 @router.post("/bills/confirm", response_model=BillConfirmResponse, status_code=201)
-async def confirm_supplier_bill(data: BillConfirmRequest, db: AsyncSession = Depends(get_db)):
+async def confirm_supplier_bill(
+    data: BillConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
+):
     """Record a reviewed bill: supplier, received purchase order, new materials and PURCHASE stock entries."""
     lines = [ln for ln in data.lines if ln.action != "SKIP"]
     if not lines:
@@ -102,12 +142,18 @@ async def confirm_supplier_bill(data: BillConfirmRequest, db: AsyncSession = Dep
     supplier_name = data.supplier_name.strip()
     bill_number = data.bill_number.strip()
     supplier = (
-        await db.execute(select(Supplier).where(func.lower(Supplier.name) == supplier_name.lower()))
+        await db.execute(
+            select(Supplier).where(
+                Supplier.tenant_id == current_user.tenant_id,
+                func.lower(Supplier.name) == supplier_name.lower(),
+            )
+        )
     ).scalars().first()
     if supplier:
         duplicate = (
             await db.execute(
                 select(PurchaseOrder.id).where(
+                    PurchaseOrder.tenant_id == current_user.tenant_id,
                     PurchaseOrder.supplier_id == supplier.id,
                     func.lower(PurchaseOrder.invoice_number) == bill_number.lower(),
                 )
@@ -119,7 +165,7 @@ async def confirm_supplier_bill(data: BillConfirmRequest, db: AsyncSession = Dep
                 detail=f"DUPLICATE_BILL: Bill {bill_number} from {supplier.name} has already been recorded.",
             )
     else:
-        supplier = Supplier(name=supplier_name)
+        supplier = Supplier(name=supplier_name, tenant_id=current_user.tenant_id)
         db.add(supplier)
         await db.flush()
 
@@ -129,7 +175,7 @@ async def confirm_supplier_bill(data: BillConfirmRequest, db: AsyncSession = Dep
     for ln in lines:
         if ln.action == "MATCH":
             item = await db.get(InventoryItem, ln.inventory_item_id) if ln.inventory_item_id else None
-            if not item:
+            if not item or item.tenant_id != current_user.tenant_id:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Choose a raw material for '{ln.description}'.")
         else:
             name = (ln.new_name or ln.description or "").strip()
@@ -139,12 +185,13 @@ async def confirm_supplier_bill(data: BillConfirmRequest, db: AsyncSession = Dep
             if unit not in ALLOWED_UNITS:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Choose a unit (kg, g, l, ml, pcs) for '{name}'.")
             sku = (ln.new_sku or "").strip().upper() or "RM-" + re.sub(r"[^A-Z0-9]+", "-", name.upper()).strip("-")[:40]
-            if (await db.execute(select(InventoryItem.id).where(InventoryItem.sku == sku))).first():
+            if (await db.execute(select(InventoryItem.id).where(InventoryItem.tenant_id == current_user.tenant_id, InventoryItem.sku == sku))).first():
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"SKU_EXISTS: A raw material with SKU {sku} already exists. Match '{name}' to it instead.",
                 )
             item = InventoryItem(
+                tenant_id=current_user.tenant_id,
                 sku=sku, name=name[:100], unit_of_measure=unit,
                 current_stock=Decimal("0"), reorder_threshold=ln.new_reorder_threshold or Decimal("0"),
             )
@@ -155,6 +202,7 @@ async def confirm_supplier_bill(data: BillConfirmRequest, db: AsyncSession = Dep
 
     total_cost = sum((ln.quantity * ln.unit_cost for _, ln in resolved), Decimal("0")).quantize(Decimal("0.01"))
     po = PurchaseOrder(
+        tenant_id=current_user.tenant_id,
         supplier_id=supplier.id, status="RECEIVED", total_cost=total_cost,
         invoice_number=bill_number, invoice_date=data.bill_date,
     )
@@ -184,10 +232,12 @@ async def confirm_supplier_bill(data: BillConfirmRequest, db: AsyncSession = Dep
 async def list_scanned_supplier_bills(
     limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
 ):
     """List confirmed supplier purchase bills (scanned invoices) with their bill IDs and line items."""
     stmt = (
         select(PurchaseOrder)
+        .where(PurchaseOrder.tenant_id == current_user.tenant_id)
         .options(
             selectinload(PurchaseOrder.supplier),
             selectinload(PurchaseOrder.items).selectinload(PurchaseOrderItem.inventory_item),

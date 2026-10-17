@@ -29,7 +29,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def create_access_token(
-    subject: Union[str, Any], expires_delta: Optional[datetime.timedelta] = None
+    subject: Union[str, Any],
+    expires_delta: Optional[datetime.timedelta] = None,
+    tenant_id: Optional[Union[str, Any]] = None,
 ) -> str:
     if expires_delta:
         expire = datetime.datetime.now(datetime.timezone.utc) + expires_delta
@@ -38,11 +40,15 @@ def create_access_token(
             minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
         )
     to_encode = {"exp": expire, "sub": str(subject), "type": "access"}
+    if tenant_id is not None:
+        to_encode["tenant_id"] = str(tenant_id)
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
 def create_refresh_token(
-    subject: Union[str, Any], expires_delta: Optional[datetime.timedelta] = None
+    subject: Union[str, Any],
+    expires_delta: Optional[datetime.timedelta] = None,
+    tenant_id: Optional[Union[str, Any]] = None,
 ) -> str:
     if expires_delta:
         expire = datetime.datetime.now(datetime.timezone.utc) + expires_delta
@@ -52,6 +58,8 @@ def create_refresh_token(
             minutes=expire_minutes
         )
     to_encode = {"exp": expire, "sub": str(subject), "type": "refresh"}
+    if tenant_id is not None:
+        to_encode["tenant_id"] = str(tenant_id)
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 

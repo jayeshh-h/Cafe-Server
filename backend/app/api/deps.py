@@ -4,24 +4,20 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, get_db
 from app.core.security import decode_token
+from app.core.tenant import get_current_tenant
+from app.models.tenant import Tenant
 from app.models.user import User, Role, Permission
-from app.models.table import DiningSession
+from app.models.table import DiningSession, Table
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
-
-
 async def get_current_user(
-    db: AsyncSession = Depends(get_db), token: Optional[str] = Depends(oauth2_scheme)
+    db: AsyncSession = Depends(get_db),
+    token: Optional[str] = Depends(oauth2_scheme),
+    current_tenant: Tenant = Depends(get_current_tenant),
 ) -> User:
     if not token:
         raise HTTPException(
@@ -36,6 +32,15 @@ async def get_current_user(
             detail="Invalid or expired access token.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # 1. Enforce cross-tenant JWT claim barrier
+    token_tenant_id = payload.get("tenant_id")
+    if token_tenant_id and str(token_tenant_id) != str(current_tenant.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cross-tenant access forbidden: Token was issued for a different tenant.",
+        )
+
     user_id_str = payload.get("sub")
     if not user_id_str or not user_id_str.isdigit():
         raise HTTPException(
@@ -43,17 +48,23 @@ async def get_current_user(
             detail="Invalid token payload subject.",
         )
     user_id = int(user_id_str)
+
+    # 2. Scope query strictly to the current tenant
     query = (
         select(User)
         .options(selectinload(User.role))
-        .where(User.id == user_id, User.is_active == True)
+        .where(
+            User.id == user_id,
+            User.tenant_id == current_tenant.id,
+            User.is_active == True,
+        )
     )
     result = await db.execute(query)
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found or account is deactivated.",
+            detail="User not found or account is deactivated for this tenant.",
         )
     return user
 
@@ -134,6 +145,12 @@ async def verify_dining_session_access(
                     )
                     user = u_res.scalar_one_or_none()
                     if user:
+                        table = await db.get(Table, session.table_id)
+                        if table and user.tenant_id != table.tenant_id:
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Access denied: Cannot access another tenant's dining session.",
+                            )
                         role = user.__dict__.get("role")
                         if not role and user.role_id:
                             r_res = await db.execute(select(Role).where(Role.id == user.role_id))
@@ -146,6 +163,8 @@ async def verify_dining_session_access(
                             perms = (await db.execute(q)).scalars().all()
                             if "pos:access" in perms:
                                 return session
+        except HTTPException:
+            raise
         except Exception:
             pass
 
@@ -201,6 +220,12 @@ async def verify_dining_session_close_access(
                     )
                     user = u_res.scalar_one_or_none()
                     if user:
+                        table = await db.get(Table, session.table_id)
+                        if table and user.tenant_id != table.tenant_id:
+                            raise HTTPException(
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Access denied: Cannot close another tenant's dining session.",
+                            )
                         role = user.__dict__.get("role")
                         if not role and user.role_id:
                             r_res = await db.execute(select(Role).where(Role.id == user.role_id))
@@ -213,6 +238,8 @@ async def verify_dining_session_close_access(
                             perms = (await db.execute(q)).scalars().all()
                             if "pos:access" in perms:
                                 return session
+        except HTTPException:
+            raise
         except Exception:
             pass
 

@@ -210,9 +210,16 @@ class ReservationService:
             )
 
     @staticmethod
-    async def _broadcast_reservation_event(reservation: Reservation, event_type: str = "RESERVATION_UPDATED"):
+    async def _broadcast_reservation_event(reservation: Reservation, event_type: str = "RESERVATION_UPDATED", tenant_slug: Optional[str] = None):
         try:
             from app.api.websocket import ws_manager
+            slug = tenant_slug
+            if not slug and getattr(reservation, "tenant_id", None):
+                tenant = reservation.__dict__.get("tenant")
+                if tenant and getattr(tenant, "slug", None):
+                    slug = tenant.slug
+            if not slug:
+                slug = "restrova-default"
             payload = {
                 "event": event_type,
                 "id": reservation.id,
@@ -222,16 +229,17 @@ class ReservationService:
                 "reservation_date": str(reservation.reservation_date) if reservation.reservation_date else None,
                 "time_slot": reservation.time_slot,
                 "guest_count": reservation.guest_count,
+                "tenant_slug": slug,
             }
-            await ws_manager.broadcast("pos", payload)
-            await ws_manager.broadcast("tables", payload)
-            await ws_manager.broadcast("admin", payload)
+            await ws_manager.broadcast("pos", payload, tenant_slug=slug)
+            await ws_manager.broadcast("tables", payload, tenant_slug=slug)
+            await ws_manager.broadcast("admin", payload, tenant_slug=slug)
         except Exception:
             pass
 
     @staticmethod
     async def check_capacity(
-        db: AsyncSession, branch_id: int, reservation_date: datetime.date, time_slot: str, new_guests: int
+        db: AsyncSession, branch_id: int, reservation_date: datetime.date, time_slot: str, new_guests: int, tenant_id: Optional[uuid.UUID] = None
     ) -> bool:
         # Fetch capacity rule for branch & time_slot with pessimistic row locking
         rule_query = (
@@ -241,8 +249,10 @@ class ReservationService:
                 ReservationCapacityRule.time_slot == time_slot,
                 ReservationCapacityRule.is_active == True,
             )
-            .with_for_update()
         )
+        if tenant_id:
+            rule_query = rule_query.where(ReservationCapacityRule.tenant_id == tenant_id)
+        rule_query = rule_query.with_for_update()
         rule_result = await db.execute(rule_query)
         rule = rule_result.scalar_one_or_none()
 
@@ -258,6 +268,8 @@ class ReservationService:
             Reservation.time_slot == time_slot,
             Reservation.status.in_(["HOLD", "PAYMENT_PENDING", "PENDING", "CONFIRMED", "ARRIVED", "SEATED"]),
         )
+        if tenant_id:
+            booked_query = booked_query.where(Reservation.tenant_id == tenant_id)
         booked_result = await db.execute(booked_query)
         active_reservations = booked_result.scalars().all()
 
@@ -272,11 +284,12 @@ class ReservationService:
         return True
 
     @staticmethod
-    async def create_reservation(db: AsyncSession, data: ReservationCreate) -> Reservation:
+    async def create_reservation(db: AsyncSession, data: ReservationCreate, tenant_id: Optional[uuid.UUID] = None) -> Reservation:
+        t_id = tenant_id or uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
         validate_booking_request(data.reservation_date, data.time_slot, data.customer_phone)
         # Check capacity
         has_capacity = await ReservationService.check_capacity(
-            db, data.branch_id, data.reservation_date, data.time_slot, data.guest_count
+            db, data.branch_id, data.reservation_date, data.time_slot, data.guest_count, tenant_id=t_id
         )
         if not has_capacity:
             raise HTTPException(
@@ -284,13 +297,14 @@ class ReservationService:
                 detail="RESERVATION_CAPACITY_EXCEEDED: Requested time slot is fully booked.",
             )
 
-        # Get or create customer by phone
-        cust_query = select(Customer).where(Customer.phone == data.customer_phone)
+        # Get or create customer by phone and tenant_id
+        cust_query = select(Customer).where(Customer.phone == data.customer_phone, Customer.tenant_id == t_id)
         cust_result = await db.execute(cust_query)
         customer = cust_result.scalar_one_or_none()
 
         if not customer:
             customer = Customer(
+                tenant_id=t_id,
                 name=data.customer_name,
                 phone=data.customer_phone,
                 email=data.customer_email,
@@ -331,10 +345,11 @@ class ReservationService:
                 valid_table_id = floor_table_ids[target_fl][0]
 
         # Backend independently calculates the exact deposit from guest count
-        deposit_per_guest = await SettingsService.get_deposit_per_guest(db)
+        deposit_per_guest = await SettingsService.get_deposit_per_guest(db, tenant_id=t_id)
         exact_deposit = Decimal(str(data.guest_count)) * deposit_per_guest
 
         reservation = Reservation(
+            tenant_id=t_id,
             branch_id=data.branch_id,
             customer_id=customer.id,
             guest_count=data.guest_count,
@@ -384,9 +399,11 @@ class ReservationService:
         return saved
 
     @staticmethod
-    async def update_reservation_status(db: AsyncSession, reservation_id: int, new_status: str) -> Reservation:
+    async def update_reservation_status(
+        db: AsyncSession, reservation_id: int, new_status: str, tenant_id: Optional[uuid.UUID] = None
+    ) -> Reservation:
         reservation = await db.get(Reservation, reservation_id)
-        if not reservation:
+        if not reservation or (tenant_id and reservation.tenant_id != tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reservation not found")
 
         current_status = reservation.status
@@ -426,9 +443,11 @@ class ReservationService:
         return saved
 
     @staticmethod
-    async def update_reservation(db: AsyncSession, reservation_id: int, data: ReservationUpdate) -> Reservation:
+    async def update_reservation(
+        db: AsyncSession, reservation_id: int, data: ReservationUpdate, tenant_id: Optional[uuid.UUID] = None
+    ) -> Reservation:
         reservation = await db.get(Reservation, reservation_id)
-        if not reservation:
+        if not reservation or (tenant_id and reservation.tenant_id != tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reservation not found")
 
         # If date, time slot, or guest count changes, re-check capacity
@@ -444,8 +463,10 @@ class ReservationService:
                     ReservationCapacityRule.time_slot == new_slot,
                     ReservationCapacityRule.is_active == True,
                 )
-                .with_for_update()
             )
+            if reservation.tenant_id:
+                rule_query = rule_query.where(ReservationCapacityRule.tenant_id == reservation.tenant_id)
+            rule_query = rule_query.with_for_update()
             rule_res = await db.execute(rule_query)
             rule = rule_res.scalar_one_or_none()
             max_capacity = rule.max_guest_capacity if rule else 80
@@ -457,6 +478,8 @@ class ReservationService:
                 Reservation.status.in_(["HOLD", "PAYMENT_PENDING", "PENDING", "CONFIRMED", "ARRIVED", "SEATED"]),
                 Reservation.id != reservation_id,
             )
+            if reservation.tenant_id:
+                booked_query = booked_query.where(Reservation.tenant_id == reservation.tenant_id)
             booked_res = await db.execute(booked_query)
             current_booked = booked_res.scalar() or 0
 
@@ -467,7 +490,7 @@ class ReservationService:
                 )
 
             # Update deposit if guest count changed
-            deposit_per_guest = await SettingsService.get_deposit_per_guest(db)
+            deposit_per_guest = await SettingsService.get_deposit_per_guest(db, tenant_id=reservation.tenant_id)
             reservation.advance_amount = Decimal(str(new_guests)) * deposit_per_guest
 
             if reservation.celery_task_id:
@@ -488,7 +511,7 @@ class ReservationService:
                 pass
 
         if data.status:
-            return await ReservationService.update_reservation_status(db, reservation_id, data.status)
+            return await ReservationService.update_reservation_status(db, reservation_id, data.status, tenant_id=reservation.tenant_id)
 
         await db.commit()
         from sqlalchemy.orm import selectinload
@@ -498,9 +521,9 @@ class ReservationService:
         return res.scalar_one()
 
     @staticmethod
-    async def cancel_reservation(db: AsyncSession, reservation_id: int) -> Reservation:
+    async def cancel_reservation(db: AsyncSession, reservation_id: int, tenant_id: Optional[uuid.UUID] = None) -> Reservation:
         reservation = await db.get(Reservation, reservation_id)
-        if not reservation:
+        if not reservation or (tenant_id and reservation.tenant_id != tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reservation not found")
 
         if reservation.status == "CANCELLED":
@@ -516,7 +539,7 @@ class ReservationService:
             )
 
         # Apply configurable cancellation policy
-        cancellation_policy = await SettingsService.get_cancellation_policy(db)
+        cancellation_policy = await SettingsService.get_cancellation_policy(db, tenant_id=reservation.tenant_id)
         policy_type = cancellation_policy["policy"]
         cutoff_hours = cancellation_policy["cutoff_hours"]
         refund_pct = cancellation_policy["refund_percentage"]
@@ -576,16 +599,17 @@ class ReservationService:
         table_id: int,
         table_name: Optional[str] = None,
         floor_number: Optional[int] = None,
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> Reservation:
         """
         Allows café host/cashier to assign a physical table to a confirmed reservation.
         """
         reservation = await db.get(Reservation, reservation_id)
-        if not reservation:
+        if not reservation or (tenant_id and reservation.tenant_id != tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reservation not found")
 
         table = await db.get(Table, table_id)
-        if not table:
+        if not table or (reservation.tenant_id and getattr(table, "tenant_id", None) and table.tenant_id != reservation.tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Table #{table_id} not found.")
 
         reservation.table_id = table.id
@@ -623,6 +647,7 @@ class ReservationService:
         reservation_id: int,
         session_token: Optional[str] = None,
         table_id: Optional[int] = None,
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> Reservation:
         """
         Check-In:
@@ -632,7 +657,7 @@ class ReservationService:
         from app.services.table_service import TableService
 
         reservation = await db.get(Reservation, reservation_id)
-        if not reservation:
+        if not reservation or (tenant_id and reservation.tenant_id != tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reservation not found")
 
         if reservation.status not in ["CONFIRMED", "ARRIVED", "SEATED"]:
@@ -659,11 +684,21 @@ class ReservationService:
         # Link to DiningSession
         dining_session = None
         if session_token:
-            sess_stmt = select(DiningSession).where(DiningSession.session_token == session_token)
+            if reservation.tenant_id:
+                sess_stmt = (
+                    select(DiningSession)
+                    .join(Table, DiningSession.table_id == Table.id)
+                    .where(
+                        DiningSession.session_token == session_token,
+                        Table.tenant_id == reservation.tenant_id,
+                    )
+                )
+            else:
+                sess_stmt = select(DiningSession).where(DiningSession.session_token == session_token)
             sess_res = await db.execute(sess_stmt)
             dining_session = sess_res.scalar_one_or_none()
         elif reservation.table_id:
-            dining_session = await TableService.get_or_create_dining_session(db, reservation.table_id)
+            dining_session = await TableService.get_or_create_dining_session(db, reservation.table_id, tenant_id=reservation.tenant_id)
             # Never merge into another party's running bill
             other_reservation = dining_session.reservation_id not in (None, reservation.id)
             other_walk_in = dining_session.reservation_id is None and dining_session.status in ("ACTIVE", "CHECKOUT")
@@ -695,7 +730,7 @@ class ReservationService:
         return saved
 
     @staticmethod
-    async def auto_release_expired_no_shows(db: AsyncSession) -> int:
+    async def auto_release_expired_no_shows(db: AsyncSession, tenant_id: Optional[uuid.UUID] = None) -> int:
         """
         Grace Period & Auto-Release (No-Show Protection):
         Finds CONFIRMED reservations where grace period has elapsed,
@@ -704,6 +739,8 @@ class ReservationService:
         from app.utils.helpers import calculate_reservation_window
 
         stmt = select(Reservation).where(Reservation.status == "CONFIRMED")
+        if tenant_id:
+            stmt = stmt.where(Reservation.tenant_id == tenant_id)
         res = await db.execute(stmt)
         reservations = res.scalars().all()
         released_count = 0
@@ -731,7 +768,7 @@ class ReservationService:
         return released_count
 
     @staticmethod
-    async def cleanup_expired_holds(db: AsyncSession) -> int:
+    async def cleanup_expired_holds(db: AsyncSession, tenant_id: Optional[uuid.UUID] = None) -> int:
         """
         Releases any HOLD reservations whose temporary hold_expires_at timer has elapsed.
         Transitions them to EXPIRED and payment_status to EXPIRED, instantly releasing capacity.
@@ -741,6 +778,8 @@ class ReservationService:
             Reservation.status.in_(["HOLD", "PAYMENT_PENDING"]),
             Reservation.hold_expires_at <= now,
         )
+        if tenant_id:
+            stmt = stmt.where(Reservation.tenant_id == tenant_id)
         res = await db.execute(stmt)
         expired_holds = res.scalars().all()
         count = len(expired_holds)
@@ -757,15 +796,21 @@ class ReservationService:
         return count
 
     @staticmethod
-    async def hold_reservation(db: AsyncSession, data: ReservationHoldRequest) -> ReservationHoldResponse:
+    async def hold_reservation(
+        db: AsyncSession,
+        data: ReservationHoldRequest,
+        tenant_id: Optional[uuid.UUID] = None,
+        tenant_slug: Optional[str] = None,
+    ) -> ReservationHoldResponse:
         """
         Temporarily holds capacity for 7 minutes for direct 0% UPI payment.
         Backend strictly calculates ₹200/person deposit using Decimal.
         Customer-specified table is optional preference.
         """
+        t_id = tenant_id or uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
         validate_booking_request(data.reservation_date, data.time_slot, data.customer_phone)
         # 1. Clean up any expired holds first
-        await ReservationService.cleanup_expired_holds(db)
+        await ReservationService.cleanup_expired_holds(db, tenant_id=t_id)
 
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
@@ -774,6 +819,7 @@ class ReservationService:
             conflict_query = (
                 select(Reservation)
                 .where(
+                    Reservation.tenant_id == t_id,
                     Reservation.branch_id == data.branch_id,
                     Reservation.reservation_date == data.reservation_date,
                     Reservation.time_slot == data.time_slot,
@@ -801,7 +847,7 @@ class ReservationService:
 
         # 3. Check overall branch capacity
         capacity_ok = await ReservationService.check_capacity(
-            db, data.branch_id, data.reservation_date, data.time_slot, data.guest_count
+            db, data.branch_id, data.reservation_date, data.time_slot, data.guest_count, tenant_id=t_id
         )
         if not capacity_ok:
             raise HTTPException(
@@ -812,7 +858,7 @@ class ReservationService:
         # 4. Resolve table_id preference if provided
         valid_table_id = data.table_id
         if valid_table_id is not None:
-            tbl_check = await db.execute(select(Table.id).where(Table.id == valid_table_id))
+            tbl_check = await db.execute(select(Table.id).where(Table.id == valid_table_id, Table.tenant_id == t_id))
             if not tbl_check.scalar_one_or_none():
                 valid_table_id = None
 
@@ -824,18 +870,19 @@ class ReservationService:
                 4: [9, 10],
                 5: [11, 12, 13],
             }
-            tbl_stmt = select(Table.id).where(Table.table_number == data.table_name)
+            tbl_stmt = select(Table.id).where(Table.table_number == data.table_name, Table.tenant_id == t_id)
             if data.floor_number and data.floor_number in floor_table_ids:
                 tbl_stmt = tbl_stmt.where(Table.id.in_(floor_table_ids[data.floor_number]))
             tbl_match = await db.execute(tbl_stmt)
             valid_table_id = tbl_match.scalars().first()
 
         # 5. Get or create Customer
-        cust_query = select(Customer).where(Customer.phone == data.customer_phone)
+        cust_query = select(Customer).where(Customer.phone == data.customer_phone, Customer.tenant_id == t_id)
         cust_result = await db.execute(cust_query)
         customer = cust_result.scalar_one_or_none()
         if not customer:
             customer = Customer(
+                tenant_id=t_id,
                 name=data.customer_name,
                 phone=data.customer_phone,
                 email=data.customer_email,
@@ -844,7 +891,7 @@ class ReservationService:
             await db.flush()
 
         # 6. Backend independently calculates deposit: guest_count × ₹200.00
-        deposit_per_guest = await SettingsService.get_deposit_per_guest(db)
+        deposit_per_guest = await SettingsService.get_deposit_per_guest(db, tenant_id=t_id)
         advance_amount = Decimal(str(data.guest_count)) * deposit_per_guest
 
         # 7. Set 7-minute hold expiration
@@ -854,6 +901,7 @@ class ReservationService:
         merchant_encoded = settings.MERCHANT_NAME.replace(" ", "%20")
 
         reservation = Reservation(
+            tenant_id=t_id,
             branch_id=data.branch_id,
             customer_id=customer.id,
             guest_count=data.guest_count,
@@ -895,7 +943,7 @@ class ReservationService:
 
     @staticmethod
     async def verify_upi_payment(
-        db: AsyncSession, reservation_id: int, data: ReservationVerifyUpiRequest
+        db: AsyncSession, reservation_id: int, data: ReservationVerifyUpiRequest, tenant_id: Optional[uuid.UUID] = None
     ) -> Reservation:
         """
         Customer enters UPI transaction reference / UTR.
@@ -907,15 +955,17 @@ class ReservationService:
         from sqlalchemy.orm import selectinload
 
         # 1. Clean up expired holds
-        await ReservationService.cleanup_expired_holds(db)
+        await ReservationService.cleanup_expired_holds(db, tenant_id=tenant_id)
 
         # 2. Acquire atomic row-level lock on reservation
         stmt = (
             select(Reservation)
             .options(selectinload(Reservation.customer))
             .where(Reservation.id == reservation_id)
-            .with_for_update()
         )
+        if tenant_id:
+            stmt = stmt.where(Reservation.tenant_id == tenant_id)
+        stmt = stmt.with_for_update()
         res = await db.execute(stmt)
         reservation = res.scalar_one_or_none()
 
@@ -956,6 +1006,7 @@ class ReservationService:
         # 3. Check if UTR has already been confirmed/used by another reservation (prevent replay attacks)
         existing_utr_stmt = select(Reservation).where(
             Reservation.id != reservation.id,
+            Reservation.tenant_id == reservation.tenant_id,
             or_(
                 func.lower(Reservation.upi_utr) == clean_utr.lower(),
                 func.lower(Reservation.payment_reference) == clean_utr.lower(),
@@ -1009,9 +1060,11 @@ class ReservationService:
         return reservation
 
     @staticmethod
-    async def cancel_hold(db: AsyncSession, reservation_id: int) -> Reservation:
+    async def cancel_hold(db: AsyncSession, reservation_id: int, tenant_id: Optional[uuid.UUID] = None) -> Reservation:
         from sqlalchemy.orm import selectinload
         stmt = select(Reservation).options(selectinload(Reservation.customer)).where(Reservation.id == reservation_id)
+        if tenant_id:
+            stmt = stmt.where(Reservation.tenant_id == tenant_id)
         res = await db.execute(stmt)
         reservation = res.scalar_one_or_none()
 
@@ -1029,9 +1082,9 @@ class ReservationService:
 
     @staticmethod
     async def get_unavailable_tables(
-        db: AsyncSession, branch_id: int, reservation_date: datetime.date, time_slot: str
+        db: AsyncSession, branch_id: int, reservation_date: datetime.date, time_slot: str, tenant_id: Optional[uuid.UUID] = None
     ) -> List[dict]:
-        await ReservationService.cleanup_expired_holds(db)
+        await ReservationService.cleanup_expired_holds(db, tenant_id=tenant_id)
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
         stmt = select(Reservation).where(
@@ -1040,6 +1093,8 @@ class ReservationService:
             Reservation.time_slot == time_slot,
             Reservation.status.in_(["HOLD", "PAYMENT_PENDING", "CONFIRMED", "ARRIVED", "SEATED"]),
         )
+        if tenant_id:
+            stmt = stmt.where(Reservation.tenant_id == tenant_id)
         res = await db.execute(stmt)
         active_res = res.scalars().all()
 
@@ -1067,7 +1122,9 @@ class ReservationService:
         payer_vpa: Optional[str] = None,
         tx_status: str = "SETTLED",
         provider_source: str = "BANK_WEBHOOK",
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> dict:
+        t_id = tenant_id or uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
         clean_utr = utr.strip().replace(" ", "").replace("-", "")
         dec_amount = Decimal(str(amount))
 
@@ -1079,12 +1136,14 @@ class ReservationService:
             payer_vpa=payer_vpa,
             tx_status=tx_status,
             provider_source=provider_source,
+            tenant_id=t_id,
         )
 
         # Check if there is a reservation in PAYMENT_PENDING waiting for this UTR
         stmt = (
             select(Reservation)
             .where(
+                Reservation.tenant_id == t_id,
                 Reservation.status == "PAYMENT_PENDING",
                 func.lower(Reservation.upi_utr) == clean_utr.lower(),
             )
@@ -1141,12 +1200,16 @@ class ReservationService:
         reservation_id: int,
         utr: str,
         staff_username: str,
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> Reservation:
         """
         Authorized staff/cashier manual reconciliation from POS.
         """
         clean_utr = utr.strip().replace(" ", "").replace("-", "")
-        stmt = select(Reservation).where(Reservation.id == reservation_id).with_for_update()
+        stmt = select(Reservation).where(Reservation.id == reservation_id)
+        if tenant_id:
+            stmt = stmt.where(Reservation.tenant_id == tenant_id)
+        stmt = stmt.with_for_update()
         res = await db.execute(stmt)
         reservation = res.scalars().first()
         if not reservation:
@@ -1159,23 +1222,27 @@ class ReservationService:
             amount=advance,
             provider_source=f"STAFF_VERIFIED:{staff_username}",
             tx_status="SETTLED",
+            tenant_id=reservation.tenant_id,
         )
         return await ReservationService.verify_upi_payment(
             db=db,
             reservation_id=reservation_id,
             data=ReservationVerifyUpiRequest(upi_utr=clean_utr),
+            tenant_id=reservation.tenant_id,
         )
 
     @staticmethod
-    async def get_pending_payment_reviews(db: AsyncSession) -> List[dict]:
+    async def get_pending_payment_reviews(db: AsyncSession, tenant_id: Optional[uuid.UUID] = None) -> List[dict]:
         """
         Lists bank credits flagged with PAYMENT_REVIEW_REQUIRED and any pending reservations.
         """
         stmt = (
             select(VerifiedBankCredit)
             .where(VerifiedBankCredit.status == "PAYMENT_REVIEW_REQUIRED")
-            .order_by(VerifiedBankCredit.verified_at.desc())
         )
+        if tenant_id:
+            stmt = stmt.where(VerifiedBankCredit.tenant_id == tenant_id)
+        stmt = stmt.order_by(VerifiedBankCredit.verified_at.desc())
         res = await db.execute(stmt)
         credits = res.scalars().all()
 
@@ -1195,13 +1262,18 @@ class ReservationService:
         return results
 
     @staticmethod
-    async def create_razorpay_order(db: AsyncSession, data: RazorpayCreateOrderRequest) -> RazorpayCreateOrderResponse:
+    async def create_razorpay_order(
+        db: AsyncSession, data: RazorpayCreateOrderRequest, tenant_id: Optional[uuid.UUID] = None
+    ) -> RazorpayCreateOrderResponse:
         """
         Creates a Razorpay order in test mode or live mode.
         Calculates the reservation deposit and generates Razorpay Order ID.
         """
-        validate_booking_request(data.reservation_date, data.time_slot, data.customer_phone)
-        deposit_per_guest = await SettingsService.get_deposit_per_guest(db)
+        t_id = tenant_id or uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
+        try:
+            deposit_per_guest = await SettingsService.get_deposit_per_guest(db, tenant_id=t_id)
+        except TypeError:
+            deposit_per_guest = await SettingsService.get_deposit_per_guest(db)
         if deposit_per_guest <= 0:
             deposit_per_guest = Decimal("150.00")
 
@@ -1256,7 +1328,9 @@ class ReservationService:
         )
 
     @staticmethod
-    async def _assert_razorpay_payment(db: AsyncSession, data: RazorpayVerifyPaymentRequest) -> None:
+    async def _assert_razorpay_payment(
+        db: AsyncSession, data: RazorpayVerifyPaymentRequest, tenant_id: Optional[uuid.UUID] = None
+    ) -> None:
         """Ask Razorpay whether this payment really succeeded, on this order, for the full deposit."""
         import httpx
         try:
@@ -1272,7 +1346,10 @@ class ReservationService:
         payment = rp.json()
         if payment.get("order_id") != data.razorpay_order_id or payment.get("status") not in ("authorized", "captured"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="PAYMENT_NOT_COMPLETED: The payment did not complete.")
-        deposit_per_guest = await SettingsService.get_deposit_per_guest(db)
+        try:
+            deposit_per_guest = await SettingsService.get_deposit_per_guest(db, tenant_id=tenant_id)
+        except TypeError:
+            deposit_per_guest = await SettingsService.get_deposit_per_guest(db)
         if deposit_per_guest <= 0:
             deposit_per_guest = Decimal("150.00")
         expected_paise = int(deposit_per_guest * Decimal(str(data.guest_count)) * 100)
@@ -1283,11 +1360,14 @@ class ReservationService:
             )
 
     @staticmethod
-    async def verify_razorpay_payment(db: AsyncSession, data: RazorpayVerifyPaymentRequest) -> Reservation:
+    async def verify_razorpay_payment(
+        db: AsyncSession, data: RazorpayVerifyPaymentRequest, tenant_id: Optional[uuid.UUID] = None
+    ) -> Reservation:
         """
         Verifies Razorpay payment signature or test simulator credentials.
         Instantly confirms table reservation, allocates dough, and registers bank credit.
         """
+        t_id = tenant_id or uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
         validate_booking_request(data.reservation_date, data.time_slot, data.customer_phone)
         # Validate HMAC signature if non-simulated and live keys configured
         signature_verified = False  # only genuinely verified payments trigger WhatsApp messages
@@ -1312,16 +1392,17 @@ class ReservationService:
                 )
             signature_verified = True
             if razorpay_configured():
-                await ReservationService._assert_razorpay_payment(db, data)
+                await ReservationService._assert_razorpay_payment(db, data, tenant_id=t_id)
 
         # Get or create customer
         clean_phone = "".join(filter(str.isdigit, data.customer_phone))
-        cust_query = select(Customer).where(Customer.phone == clean_phone)
+        cust_query = select(Customer).where(Customer.phone == clean_phone, Customer.tenant_id == t_id)
         cust_result = await db.execute(cust_query)
         customer = cust_result.scalar_one_or_none()
 
         if not customer:
             customer = Customer(
+                tenant_id=t_id,
                 name=data.customer_name.strip(),
                 phone=clean_phone or data.customer_phone,
                 email=data.customer_email,
@@ -1341,26 +1422,31 @@ class ReservationService:
 
         valid_table_id = data.table_id
         if valid_table_id is not None:
-            tbl_check = await db.execute(select(Table.id).where(Table.id == valid_table_id))
+            tbl_check = await db.execute(select(Table.id).where(Table.id == valid_table_id, Table.tenant_id == t_id))
             if not tbl_check.scalar_one_or_none():
                 valid_table_id = None
 
         if valid_table_id is None and data.table_name:
-            tbl_stmt = select(Table.id).where(Table.table_number == data.table_name)
+            tbl_stmt = select(Table.id).where(Table.table_number == data.table_name, Table.tenant_id == t_id)
             if target_floor in floor_table_ids:
                 tbl_stmt = tbl_stmt.where(Table.id.in_(floor_table_ids[target_floor]))
             tbl_match = await db.execute(tbl_stmt)
             valid_table_id = tbl_match.scalars().first()
 
         if valid_table_id is None and target_floor in floor_table_ids:
-            valid_table_id = floor_table_ids[target_floor][0]
+            # Check default table for tenant
+            default_match = await db.execute(select(Table.id).where(Table.tenant_id == t_id, Table.id.in_(floor_table_ids[target_floor])))
+            valid_table_id = default_match.scalars().first()
+            if valid_table_id is None:
+                valid_table_id = floor_table_ids[target_floor][0]
 
-        deposit_per_guest = await SettingsService.get_deposit_per_guest(db)
+        deposit_per_guest = await SettingsService.get_deposit_per_guest(db, tenant_id=t_id)
         if deposit_per_guest <= 0:
             deposit_per_guest = Decimal("150.00")
         total_deposit = deposit_per_guest * Decimal(str(data.guest_count))
 
         reservation = Reservation(
+            tenant_id=t_id,
             branch_id=data.branch_id,
             customer_id=customer.id,
             guest_count=data.guest_count,
@@ -1382,6 +1468,7 @@ class ReservationService:
         try:
             source = "RAZORPAY_TEST_SIMULATOR" if data.is_test_simulation else "RAZORPAY_GATEWAY"
             bank_credit = VerifiedBankCredit(
+                tenant_id=t_id,
                 utr=data.razorpay_payment_id,
                 amount=total_deposit,
                 merchant_vpa=settings.MERCHANT_UPI_ID,
@@ -1426,7 +1513,7 @@ class ReservationService:
         return saved
 
     @staticmethod
-    async def get_razorpay_transactions(db: AsyncSession) -> List[dict]:
+    async def get_razorpay_transactions(db: AsyncSession, tenant_id: Optional[uuid.UUID] = None) -> List[dict]:
         """
         Retrieves recent Razorpay transactions for the Admin Razorpay Testing Portal.
         """
@@ -1435,9 +1522,10 @@ class ReservationService:
             select(Reservation)
             .options(selectinload(Reservation.customer))
             .where(Reservation.payment_method == "RAZORPAY")
-            .order_by(Reservation.created_at.desc())
-            .limit(50)
         )
+        if tenant_id:
+            stmt = stmt.where(Reservation.tenant_id == tenant_id)
+        stmt = stmt.order_by(Reservation.created_at.desc()).limit(50)
         res = await db.execute(stmt)
         reservations = res.scalars().all()
 

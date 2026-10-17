@@ -1,5 +1,7 @@
 import datetime
+import uuid
 from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, UniqueConstraint, CheckConstraint, Index
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 from app.utils.helpers import utc_now
@@ -9,6 +11,13 @@ class ItemCapacityRule(Base):
     __tablename__ = "item_capacity_rules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        default=uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210"),
+        nullable=False,
+        index=True,
+    )
     menu_item_id: Mapped[int] = mapped_column(Integer, ForeignKey("menu_items.id", ondelete="CASCADE"), unique=True, nullable=False)
     max_production_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     allocated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -17,6 +26,7 @@ class ItemCapacityRule(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     menu_item = relationship("MenuItem", back_populates="capacity_rule")
+    tenant = relationship("Tenant", foreign_keys=[tenant_id])
 
 
 class DailyProductionRule(Base):
@@ -29,6 +39,13 @@ class DailyProductionRule(Base):
     __tablename__ = "daily_production_rules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        default=uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210"),
+        nullable=False,
+        index=True,
+    )
     branch_id: Mapped[int] = mapped_column(Integer, ForeignKey("branches.id", ondelete="CASCADE"), nullable=False)
     production_date: Mapped[datetime.date] = mapped_column(Date, nullable=False, index=True)
     total_dough_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=70)
@@ -37,6 +54,7 @@ class DailyProductionRule(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     branch = relationship("Branch")
+    tenant = relationship("Tenant", foreign_keys=[tenant_id])
 
     __table_args__ = (
         UniqueConstraint("branch_id", "production_date", name="uq_daily_production_branch_date"),

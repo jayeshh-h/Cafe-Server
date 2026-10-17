@@ -22,6 +22,7 @@ async def list_customer_bills(
     """List customer dining bills with session, table, discount, tax and payment info."""
     stmt = (
         select(Bill)
+        .where(Bill.tenant_id == current_user.tenant_id)
         .options(
             selectinload(Bill.dining_session).selectinload(DiningSession.table),
             selectinload(Bill.dining_session).selectinload(DiningSession.customer),
@@ -75,4 +76,8 @@ async def process_checkout(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pos:access")),
 ):
+    bill = await db.get(Bill, id)
+    if not bill or bill.tenant_id != current_user.tenant_id:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Bill not found.")
     return await BillingService.process_checkout(db, id, payment_data)

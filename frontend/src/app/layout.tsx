@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { Plus_Jakarta_Sans, Playfair_Display, Poppins } from "next/font/google";
 import CookieConsent from "@/components/CookieConsent";
 import { Toaster } from "@/components/ui/toast";
+import { TenantThemeProvider } from "@/components/TenantThemeProvider";
 import "./globals.css";
 
 const plusJakarta = Plus_Jakarta_Sans({
@@ -126,11 +127,13 @@ export default function RootLayout({
       <body
         className={`${plusJakarta.variable} ${playfair.variable} ${poppins.variable} antialiased selection:bg-[#B85B43]/20 bg-[#F8F5F0] text-[#140E0A] min-h-screen flex flex-col justify-between`}
       >
-        <div className="flex-1">
-          {children}
-        </div>
-        <Toaster />
-        <CookieConsent />
+        <TenantThemeProvider>
+          <div className="flex-1">
+            {children}
+          </div>
+          <Toaster />
+          <CookieConsent />
+        </TenantThemeProvider>
       </body>
     </html>
   );

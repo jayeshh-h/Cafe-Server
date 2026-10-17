@@ -104,7 +104,13 @@ class CapacityService:
         res = await db.execute(stmt)
         rule = res.scalar_one_or_none()
         if not rule:
+            import uuid
+            from app.models.branch import Branch
+            b_stmt = select(Branch.tenant_id).where(Branch.id == branch_id)
+            b_res = await db.execute(b_stmt)
+            t_id = b_res.scalar_one_or_none() or uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
             rule = DailyProductionRule(
+                tenant_id=t_id,
                 branch_id=branch_id,
                 production_date=production_date,
                 total_dough_limit=70,  # sensible default; overridden by ops

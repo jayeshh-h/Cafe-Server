@@ -1,5 +1,6 @@
 import secrets
 import datetime
+import uuid
 from app.utils.helpers import utc_now
 from typing import Optional, List
 from sqlalchemy import select, or_, and_, func
@@ -51,7 +52,9 @@ class TableService:
 
 
     @staticmethod
-    async def get_or_create_dining_session(db: AsyncSession, table_id: int) -> DiningSession:
+    async def get_or_create_dining_session(
+        db: AsyncSession, table_id: int, tenant_id: Optional[uuid.UUID] = None
+    ) -> DiningSession:
         """
         Triple-Layer Concurrency-Safe Dining Session Engine:
         1. PostgreSQL Transaction
@@ -64,7 +67,7 @@ class TableService:
         tbl_res = await db.execute(tbl_stmt)
         table = tbl_res.scalar_one_or_none()
 
-        if not table:
+        if not table or (tenant_id and getattr(table, "tenant_id", None) and table.tenant_id != tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
 
         # Check for existing active session (OPENED, ACTIVE, CHECKOUT)
@@ -77,7 +80,7 @@ class TableService:
             .order_by(DiningSession.opened_at.desc())
         )
         session_res = await db.execute(session_stmt)
-        active_session = session_res.scalar_one_or_none()
+        active_session = session_res.scalars().first()
 
         if active_session:
             return active_session
@@ -111,7 +114,11 @@ class TableService:
             )
 
     @staticmethod
-    async def validate_qr_token(db: AsyncSession, qr_token: str) -> QRValidateResponse:
+    async def validate_qr_token(
+        db: AsyncSession,
+        qr_token: str,
+        expected_tenant_id: Optional[object] = None,
+    ) -> QRValidateResponse:
         # 1. Check GeneralizedQR first
         gen_stmt = select(GeneralizedQR).where(GeneralizedQR.qr_token == qr_token)
         gen_res = await db.execute(gen_stmt)
@@ -129,6 +136,12 @@ class TableService:
                 from app.utils.init_tables import ensure_default_tables
                 await ensure_default_tables(db)
                 table = await db.get(Table, 1)
+
+            if expected_tenant_id and table and table.tenant_id != expected_tenant_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="INVALID_QR_TOKEN: QR code does not belong to this restaurant.",
+                )
 
             new_session_token = f"sess_tok_{secrets.token_urlsafe(32)}"
             session = DiningSession(
@@ -204,6 +217,12 @@ class TableService:
                 detail="INACTIVE_TABLE: Table is currently inactive.",
             )
 
+        if expected_tenant_id and table.tenant_id != expected_tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="INVALID_QR_TOKEN: QR code does not belong to this restaurant.",
+            )
+
         session = await TableService.get_or_create_dining_session(db, table.id)
 
         # Check for active / upcoming reservation on this table
@@ -211,6 +230,7 @@ class TableService:
             select(Reservation)
             .options(selectinload(Reservation.customer))
             .where(
+                Reservation.tenant_id == table.tenant_id,
                 or_(
                     Reservation.table_id == table.id,
                     Reservation.table_name == table.table_number,
@@ -389,6 +409,7 @@ class TableService:
         customer_name: str,
         phone_number: str,
         guest_count: int = 2,
+        expected_tenant_id: Optional[object] = None,
     ) -> QRWalkInResponse:
         # 1. Resolve table from qr_token
         is_generalized = False
@@ -425,17 +446,24 @@ class TableService:
             if not table:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found.")
 
+        if expected_tenant_id and table and table.tenant_id != expected_tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="INVALID_QR_TOKEN: QR code does not belong to this restaurant.",
+            )
+
         # 2. Get or create Customer
         clean_name = customer_name.strip()
         clean_phone = "".join(filter(str.isdigit, phone_number))
         if not clean_phone or len(clean_phone) < 7:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please enter a valid phone number.")
 
-        cust_stmt = select(Customer).where(Customer.phone == clean_phone)
+        cust_stmt = select(Customer).where(Customer.phone == clean_phone, Customer.tenant_id == table.tenant_id)
         cust_res = await db.execute(cust_stmt)
         customer = cust_res.scalar_one_or_none()
         if not customer:
             customer = Customer(
+                tenant_id=table.tenant_id,
                 name=clean_name,
                 phone=clean_phone,
             )
@@ -464,6 +492,7 @@ class TableService:
         now = datetime.datetime.now()
         display_tbl_name = "Table allotted by server" if is_generalized else table.table_number
         walk_in_res = Reservation(
+            tenant_id=table.tenant_id,
             branch_id=table.branch_id if table else 1,
             customer_id=customer.id,
             guest_count=guest_count or 2,
@@ -496,6 +525,12 @@ class TableService:
         # 6. Broadcast event so POS, Manager, Admin update live
         try:
             from app.api.websocket import ws_manager
+            from app.models.tenant import Tenant
+            tenant_slug = None
+            if table and table.tenant_id:
+                t_obj = await db.get(Tenant, table.tenant_id)
+                if t_obj:
+                    tenant_slug = t_obj.slug
             event = {
                 "event": "TABLE_OCCUPIED",
                 "table_id": table.id if not is_generalized else None,
@@ -504,9 +539,10 @@ class TableService:
                 "reservation_id": walk_in_res.id,
                 "booking_id": walk_in_res.booking_id,
             }
-            await ws_manager.broadcast("tables", event)
-            await ws_manager.broadcast("pos", event)
+            await ws_manager.broadcast("tables", event, tenant_slug=tenant_slug)
+            await ws_manager.broadcast("pos", event, tenant_slug=tenant_slug)
         except Exception:
+            pass
             pass
 
         return QRWalkInResponse(
@@ -633,30 +669,40 @@ class TableService:
         if not session:
             raise HTTPException(status_code=400, detail="Invalid session token.")
 
+        session_table = await db.get(Table, session.table_id) if session.table_id else None
+        expected_tenant_id = session_table.tenant_id if session_table else None
+
         code = reservation_code.strip()
         if not code:
             raise HTTPException(status_code=400, detail="Please enter a reservation code.")
 
+        res_conditions = [
+            or_(
+                Reservation.id == (int(code) if code.isdigit() else -1),
+                func.upper(Reservation.booking_id) == code.upper(),
+            ),
+            Reservation.status.in_(["CONFIRMED", "ARRIVED"]),
+        ]
+        if expected_tenant_id:
+            res_conditions.append(Reservation.tenant_id == expected_tenant_id)
+
         res_stmt = (
             select(Reservation)
             .options(selectinload(Reservation.customer))
-            .where(
-                or_(
-                    Reservation.id == (int(code) if code.isdigit() else -1),
-                    func.upper(Reservation.booking_id) == code.upper(),
-                ),
-                Reservation.status.in_(["CONFIRMED", "ARRIVED"]),
-            )
+            .where(*res_conditions)
             .with_for_update()
         )
         res_res = await db.execute(res_stmt)
         reservation = res_res.scalars().first()
 
         if not reservation and len(code) >= 4:
+            fallback_conds = [Reservation.status.in_(["CONFIRMED", "ARRIVED"])]
+            if expected_tenant_id:
+                fallback_conds.append(Reservation.tenant_id == expected_tenant_id)
             all_active = await db.execute(
                 select(Reservation)
                 .options(selectinload(Reservation.customer))
-                .where(Reservation.status.in_(["CONFIRMED", "ARRIVED"]))
+                .where(*fallback_conds)
                 .order_by(Reservation.created_at.desc())
                 .with_for_update()
             )
@@ -669,7 +715,7 @@ class TableService:
                     reservation = cand
                     break
 
-        if not reservation:
+        if not reservation or (expected_tenant_id and reservation.tenant_id != expected_tenant_id):
             raise HTTPException(
                 status_code=400,
                 detail="Reservation not found or status not eligible for seating.",

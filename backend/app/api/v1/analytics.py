@@ -11,6 +11,7 @@ from app.models.billing import Bill, Payment
 from app.models.reservation import Reservation
 from app.models.menu import MenuItem, MenuCategory
 from app.models.table import DiningSession, Table
+from app.models.user import User
 from pydantic import BaseModel
 
 # Revenue figures are owner/staff-only
@@ -26,6 +27,7 @@ async def get_revenue_for_range(
     start: datetime.date = Query(..., description="First business date (inclusive), YYYY-MM-DD"),
     end: datetime.date = Query(..., description="Last business date (inclusive), YYYY-MM-DD"),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
 ):
     """Revenue (sum of KOT totals) and KOT count for business dates start..end inclusive."""
     if end < start:
@@ -34,8 +36,12 @@ async def get_revenue_for_range(
         raise HTTPException(status_code=400, detail="Range cannot exceed one year")
     row = (
         await db.execute(
-            select(func.coalesce(func.sum(KOT.total_amount), 0), func.count(KOT.id)).where(
-                KOT.business_date >= start, KOT.business_date <= end
+            select(func.coalesce(func.sum(KOT.total_amount), 0), func.count(KOT.id))
+            .join(Table, KOT.table_id == Table.id)
+            .where(
+                Table.tenant_id == current_user.tenant_id,
+                KOT.business_date >= start,
+                KOT.business_date <= end,
             )
         )
     ).one()
@@ -50,17 +56,36 @@ class AnalyticsSummary(BaseModel):
 
 
 @router.get("/summary", response_model=AnalyticsSummary)
-async def get_summary(db: AsyncSession = Depends(get_db)):
-    orders_res = await db.execute(select(func.count(Order.id)))
+async def get_summary(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
+):
+    orders_res = await db.execute(
+        select(func.count(Order.id)).where(Order.tenant_id == current_user.tenant_id)
+    )
     total_orders = orders_res.scalar() or 0
 
-    revenue_res = await db.execute(select(func.coalesce(func.sum(Payment.amount_paid), Decimal("0.00"))))
+    revenue_res = await db.execute(
+        select(func.coalesce(func.sum(Payment.amount_paid), Decimal("0.00")))
+        .join(Bill, Payment.bill_id == Bill.id)
+        .where(Bill.tenant_id == current_user.tenant_id)
+    )
     total_revenue = Decimal(str(revenue_res.scalar() or "0.00"))
 
-    res_res = await db.execute(select(func.count(Reservation.id)).where(Reservation.status == "CONFIRMED"))
+    res_res = await db.execute(
+        select(func.count(Reservation.id)).where(
+            Reservation.tenant_id == current_user.tenant_id,
+            Reservation.status == "CONFIRMED",
+        )
+    )
     active_reservations = res_res.scalar() or 0
 
-    bills_res = await db.execute(select(func.count(Bill.id)).where(Bill.is_paid == True))
+    bills_res = await db.execute(
+        select(func.count(Bill.id)).where(
+            Bill.tenant_id == current_user.tenant_id,
+            Bill.is_paid == True,
+        )
+    )
     paid_bills_count = bills_res.scalar() or 0
 
     return AnalyticsSummary(
@@ -72,7 +97,10 @@ async def get_summary(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/dashboard")
-async def get_owner_dashboard_analytics(db: AsyncSession = Depends(get_db)):
+async def get_owner_dashboard_analytics(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("pos:access")),
+):
     """Comprehensive executive analytics for the Owner Portal."""
     try:
         from app.utils.helpers import ist_now
@@ -82,7 +110,11 @@ async def get_owner_dashboard_analytics(db: AsyncSession = Depends(get_db)):
         month_start_date = today_date - datetime.timedelta(days=30)
 
         # 1. Total lifetime revenue & orders
-        all_kots_res = await db.execute(select(KOT))
+        all_kots_res = await db.execute(
+            select(KOT)
+            .join(Table, KOT.table_id == Table.id)
+            .where(Table.tenant_id == current_user.tenant_id)
+        )
         all_kots = all_kots_res.scalars().all()
         
         total_revenue = sum(float(k.total_amount or 0) for k in all_kots)
@@ -114,7 +146,11 @@ async def get_owner_dashboard_analytics(db: AsyncSession = Depends(get_db)):
             })
 
         # 4. Payment breakdown
-        payments_res = await db.execute(select(Payment))
+        payments_res = await db.execute(
+            select(Payment)
+            .join(Bill, Payment.bill_id == Bill.id)
+            .where(Bill.tenant_id == current_user.tenant_id)
+        )
         all_payments = payments_res.scalars().all()
         
         pay_upi = sum(float(p.amount_paid or 0) for p in all_payments if (p.payment_method or "").upper() == "UPI")
@@ -126,6 +162,7 @@ async def get_owner_dashboard_analytics(db: AsyncSession = Depends(get_db)):
         order_items_res = await db.execute(
             select(OrderItem, MenuItem)
             .join(MenuItem, OrderItem.menu_item_id == MenuItem.id)
+            .where(MenuItem.tenant_id == current_user.tenant_id)
         )
         item_stats: Dict[str, Dict[str, Any]] = {}
         for o_item, m_item in order_items_res.all():
@@ -143,7 +180,9 @@ async def get_owner_dashboard_analytics(db: AsyncSession = Depends(get_db)):
         top_items = sorted(item_stats.values(), key=lambda x: x["revenue"], reverse=True)[:10]
 
         # 6. Reservation Stats
-        res_all = (await db.execute(select(Reservation))).scalars().all()
+        res_all = (
+            await db.execute(select(Reservation).where(Reservation.tenant_id == current_user.tenant_id))
+        ).scalars().all()
         today_res = [r for r in res_all if getattr(r, "reservation_date", None) == today_date]
         total_advance_collected = sum(float(r.advance_amount or 0) for r in res_all if (getattr(r, "payment_status", "") or "").upper() == "PAID")
         
@@ -158,8 +197,16 @@ async def get_owner_dashboard_analytics(db: AsyncSession = Depends(get_db)):
         }
 
         # 7. Tables & Operational Counts
-        tables_res = (await db.execute(select(Table))).scalars().all()
-        sessions_res = (await db.execute(select(DiningSession))).scalars().all()
+        tables_res = (
+            await db.execute(select(Table).where(Table.tenant_id == current_user.tenant_id))
+        ).scalars().all()
+        sessions_res = (
+            await db.execute(
+                select(DiningSession)
+                .join(Table, DiningSession.table_id == Table.id)
+                .where(Table.tenant_id == current_user.tenant_id)
+            )
+        ).scalars().all()
         active_sessions = [s for s in sessions_res if (getattr(s, "status", "") or "").upper() in ["OPENED", "ACTIVE"]]
 
         return {

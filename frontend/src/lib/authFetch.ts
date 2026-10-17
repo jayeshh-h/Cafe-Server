@@ -1,5 +1,6 @@
 // fetch() for staff portals (owner admin, POS, manager) with 5-hour session expiry and auto-logout.
 // Staff logins expire automatically after 5 hours (300 minutes), prompting re-login for security.
+import { getTenantSlug } from "./tenant";
 
 export function decodeJwt(token: string): { exp?: number; sub?: string; type?: string } | null {
   try {
@@ -110,7 +111,10 @@ function createStaffSession(prefix: string): StaffSession {
         try {
           const res = await fetch("/api/v1/auth/refresh", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              "X-Tenant-Slug": getTenantSlug(),
+            },
             body: JSON.stringify({ refresh_token: refreshToken }),
           });
           if (!res.ok) {
@@ -154,12 +158,18 @@ function createStaffSession(prefix: string): StaffSession {
   };
 
   const sessionFetch = async (input: string, init: RequestInit = {}): Promise<Response> => {
-    if (!new Headers(init.headers).has("Authorization")) return fetch(input, init);
+    const baseHeaders = new Headers(init.headers);
+    if (!baseHeaders.has("X-Tenant-Slug")) {
+      baseHeaders.set("X-Tenant-Slug", getTenantSlug());
+    }
+    const baseInit = { ...init, headers: baseHeaders };
+
+    if (!baseHeaders.has("Authorization")) return fetch(input, baseInit);
 
     const withToken = (token: string): RequestInit => {
-      const h = new Headers(init.headers);
+      const h = new Headers(baseHeaders);
       h.set("Authorization", `Bearer ${token}`);
-      return { ...init, headers: h };
+      return { ...baseInit, headers: h };
     };
 
     const stored = localStorage.getItem(tokenKey);
@@ -168,12 +178,12 @@ function createStaffSession(prefix: string): StaffSession {
       if (!fresh) {
         clearSession();
         window.dispatchEvent(new Event(expiredEvent));
-        return fetch(input, init);
+        return fetch(input, baseInit);
       }
       return fetch(input, withToken(fresh));
     }
 
-    const res = await fetch(input, stored ? withToken(stored) : init);
+    const res = await fetch(input, stored ? withToken(stored) : baseInit);
     if (res.status !== 401) return res;
 
     const fresh = await refresh();

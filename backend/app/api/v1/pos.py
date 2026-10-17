@@ -26,7 +26,7 @@ async def list_kots(
             date_obj = datetime.date.fromisoformat(target_date)
         except ValueError:
             date_obj = None
-    return await POSService.get_kots(db, target_date=date_obj, limit=limit)
+    return await POSService.get_kots(db, target_date=date_obj, limit=limit, tenant_id=current_user.tenant_id)
 
 
 @router.get("/summary", response_model=POSSummaryResponse)
@@ -41,7 +41,7 @@ async def get_pos_summary(
             date_obj = datetime.date.fromisoformat(target_date)
         except ValueError:
             date_obj = None
-    return await POSService.get_summary(db, target_date=date_obj)
+    return await POSService.get_summary(db, target_date=date_obj, tenant_id=current_user.tenant_id)
 
 
 @router.get("/table-sessions", response_model=List[TableOverviewResponse])
@@ -56,7 +56,7 @@ async def list_table_sessions(
             date_obj = datetime.date.fromisoformat(target_date)
         except ValueError:
             date_obj = None
-    return await POSService.get_table_sessions(db, target_date=date_obj)
+    return await POSService.get_table_sessions(db, target_date=date_obj, tenant_id=current_user.tenant_id)
 
 
 @router.post("/kots/{id}/claim-print")
@@ -67,7 +67,7 @@ async def claim_kot_print(
     current_user: User = Depends(require_permission("pos:access")),
 ):
     """Claim a KOT for printing on this device (prevents duplicate prints) and get its ticket."""
-    return await POSService.claim_kot_print(db, kot_id=id, force=force)
+    return await POSService.claim_kot_print(db, kot_id=id, force=force, tenant_id=current_user.tenant_id)
 
 
 @router.post("/kots/{id}/printed")
@@ -77,7 +77,7 @@ async def mark_kot_printed(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pos:access")),
 ):
-    return await POSService.mark_kot_printed(db, kot_id=id, success=bool(payload.get("success", True)))
+    return await POSService.mark_kot_printed(db, kot_id=id, success=bool(payload.get("success", True)), tenant_id=current_user.tenant_id)
 
 
 @router.post("/kots/{id}/retry-print")
@@ -86,7 +86,7 @@ async def retry_kot_print(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pos:access")),
 ):
-    return await POSService.retry_kot_print(db, kot_id=id)
+    return await POSService.retry_kot_print(db, kot_id=id, tenant_id=current_user.tenant_id)
 
 
 @router.post("/sessions/{id}/close")
@@ -96,7 +96,7 @@ async def close_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pos:access")),
 ):
-    return await POSService.close_dining_session(db, session_id=id, payment_mode=payload.payment_mode if payload else None)
+    return await POSService.close_dining_session(db, session_id=id, payment_mode=payload.payment_mode if payload else None, tenant_id=current_user.tenant_id)
 
 
 @router.post("/tables/{table_id}/settle")
@@ -106,7 +106,7 @@ async def settle_table(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pos:access")),
 ):
-    return await POSService.settle_table_by_id(db, table_id=table_id, payment_mode=payload.payment_mode if payload else None)
+    return await POSService.settle_table_by_id(db, table_id=table_id, payment_mode=payload.payment_mode if payload else None, tenant_id=current_user.tenant_id)
 
 
 @router.post("/tables/merge")
@@ -117,7 +117,7 @@ async def merge_tables(
 ):
     source_table_id = int(payload.get("source_table_id", 0))
     target_table_id = int(payload.get("target_table_id", 0))
-    return await POSService.merge_tables(db, source_table_id=source_table_id, target_table_id=target_table_id)
+    return await POSService.merge_tables(db, source_table_id=source_table_id, target_table_id=target_table_id, tenant_id=current_user.tenant_id)
 
 
 @router.post("/walk-in/seat")
@@ -139,6 +139,7 @@ async def seat_walk_in(
         table_id=table_id,
         customer_name=payload.get("customer_name"),
         guest_count=guest_count,
+        tenant_id=current_user.tenant_id,
     )
 
 
@@ -150,6 +151,10 @@ async def place_staff_order(
     current_user: User = Depends(require_permission("pos:access")),
 ):
     """POS staff take an order for a table: it joins the table's running bill and sends a KOT to the kitchen."""
+    from app.models.table import Table
+    tbl = await db.get(Table, table_id)
+    if not tbl or tbl.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found.")
     order = OrderCreate(qr_token="pos-staff-order", allergy_info=payload.allergy_info, items=payload.items)
     return await OrderService.place_order(db, order, staff_table_id=table_id)
 
@@ -162,7 +167,7 @@ async def update_session_items(
     current_user: User = Depends(require_permission("pos:access")),
 ):
     items = payload.get("items", [])
-    return await POSService.update_session_items(db, session_id=id, items=items)
+    return await POSService.update_session_items(db, session_id=id, items=items, tenant_id=current_user.tenant_id)
 
 
 @router.put("/sessions/{id}/discount")
@@ -180,6 +185,7 @@ async def set_session_discount(
         discount_value=payload.discount_value,
         reason=payload.reason,
         user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
     )
     return {
         "bill_id": bill.id,
@@ -200,35 +206,40 @@ async def reset_all_sessions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pos:access")),
 ):
-    return await POSService.reset_all_sessions(db)
+    return await POSService.reset_all_sessions(db, tenant_id=current_user.tenant_id)
 
 
 @router.get("/daily-dough-capacity")
 async def get_daily_dough_capacity(
-    branch_id: int = Query(1, description="Branch ID"),
+    branch_id: Optional[int] = Query(None, description="Branch ID"),
     target_date: Optional[str] = Query(None, description="Format YYYY-MM-DD (default: today)"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("pos:access")),
 ):
     """
     Returns today's pizza dough production capacity for the POS dashboard.
-
-    Example response:
-      {
-        "total_dough_limit": 70,
-        "total_allocated_dough": 25,
-        "total_active_protected": 15,
-        "walk_in_available": 30
-      }
-
-    DAILY PIZZA CAPACITY
-    70 Total | 25 Used | 15 Protected | 30 Walk-in Available
+    Resolves dynamically to the authenticated tenant's active branch.
     """
+    from sqlalchemy import select
+    from app.models.branch import Branch
     from app.services.capacity_service import CapacityService
+
+    branch_stmt = select(Branch).where(
+        Branch.tenant_id == current_user.tenant_id,
+        Branch.is_active == True,
+    )
+    if branch_id:
+        branch_stmt = branch_stmt.where(Branch.id == branch_id)
+    else:
+        branch_stmt = branch_stmt.order_by(Branch.id)
+
+    branch = (await db.execute(branch_stmt)).scalars().first()
+    target_branch_id = branch.id if branch else (branch_id or 1)
+
     date_obj = None
     if target_date:
         try:
             date_obj = datetime.date.fromisoformat(target_date)
         except ValueError:
             date_obj = None
-    return await CapacityService.get_daily_dough_overview(db, branch_id=branch_id, target_date=date_obj)
+    return await CapacityService.get_daily_dough_overview(db, branch_id=target_branch_id, target_date=date_obj)

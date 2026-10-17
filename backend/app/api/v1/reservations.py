@@ -8,7 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db, require_permission, get_current_user
 from app.core.config import settings
+from app.core.tenant import get_current_tenant, get_optional_tenant
 from app.models.reservation import Reservation
+from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.reservation import (
     ReservationCreate,
@@ -85,24 +87,33 @@ verify_android_auth = verify_device_auth
 
 
 @router.post("/hold", response_model=ReservationHoldResponse, status_code=201)
-async def hold_reservation_slot(data: ReservationHoldRequest, db: AsyncSession = Depends(get_db)):
+async def hold_reservation_slot(
+    data: ReservationHoldRequest,
+    db: AsyncSession = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
+):
     """
     Step 1: Check availability & temporarily lock/HOLD table slot for 7 minutes.
     Backend calculates ₹200/guest deposit with Decimal precision.
     """
-    return await ReservationService.hold_reservation(db, data)
+    return await ReservationService.hold_reservation(
+        db, data, tenant_id=current_tenant.id, tenant_slug=current_tenant.slug
+    )
 
 
 @router.post("/{id}/verify-upi", response_model=ReservationResponse)
 async def verify_upi_payment(
-    id: int, data: ReservationVerifyUpiRequest, db: AsyncSession = Depends(get_db)
+    id: int,
+    data: ReservationVerifyUpiRequest,
+    db: AsyncSession = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
 ):
     """
     Step 2: Customer enters UPI UTR / Transaction reference.
     Customer UTR is only a reconciliation hint. Confirmation strictly requires
     independent bank settlement verification.
     """
-    return await ReservationService.verify_upi_payment(db, id, data)
+    return await ReservationService.verify_upi_payment(db, id, data, tenant_id=current_tenant.id)
 
 
 @router.post("/payment-event")
@@ -144,11 +155,13 @@ def verify_bank_webhook_secret(x_webhook_secret: Optional[str] = Header(None)) -
 async def receive_bank_payment_webhook(
     payload: BankWebhookPayload,
     db: AsyncSession = Depends(get_db),
+    optional_tenant: Optional[Tenant] = Depends(get_optional_tenant),
 ):
     """
     Authentic Bank / Acquirer / Gateway Webhook.
     Receives verified settlement events and automatically confirms matching reservations.
     """
+    t_id = optional_tenant.id if optional_tenant else None
     return await ReservationService.process_bank_webhook(
         db=db,
         utr=payload.utr,
@@ -157,6 +170,7 @@ async def receive_bank_payment_webhook(
         payer_vpa=payload.payer_vpa,
         tx_status=payload.tx_status,
         provider_source=payload.provider_source,
+        tenant_id=t_id,
     )
 
 
@@ -176,6 +190,7 @@ async def staff_verify_payment(
         reservation_id=id,
         utr=data.upi_utr,
         staff_username=current_user.username,
+        tenant_id=current_user.tenant_id,
     )
 
 
@@ -195,6 +210,7 @@ async def assign_table_to_reservation(
         table_id=data.table_id,
         table_name=data.table_name,
         floor_number=data.floor_number,
+        tenant_id=current_user.tenant_id,
     )
 
 
@@ -206,15 +222,19 @@ async def list_pending_payment_reviews(
     """
     Lists bank credits flagged with PAYMENT_REVIEW_REQUIRED for staff review in POS.
     """
-    return await ReservationService.get_pending_payment_reviews(db)
+    return await ReservationService.get_pending_payment_reviews(db, tenant_id=current_user.tenant_id)
 
 
 @router.post("/{id}/cancel-hold", response_model=ReservationResponse)
-async def cancel_reservation_hold(id: int, db: AsyncSession = Depends(get_db)):
+async def cancel_reservation_hold(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
+):
     """
     If customer cancels or changes mind, temporary hold is released immediately.
     """
-    return await ReservationService.cancel_hold(db, id)
+    return await ReservationService.cancel_hold(db, id, tenant_id=current_tenant.id)
 
 
 @router.get("/availability/slots")
@@ -223,16 +243,23 @@ async def get_slot_availability(
     time_slot: str = Query(...),
     branch_id: int = Query(1),
     db: AsyncSession = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
 ):
     """
     Returns list of tables that are currently locked (HELD or BOOKED) for the given date & time slot.
     """
-    return await ReservationService.get_unavailable_tables(db, branch_id, reservation_date, time_slot)
+    return await ReservationService.get_unavailable_tables(
+        db, branch_id, reservation_date, time_slot, tenant_id=current_tenant.id
+    )
 
 
-@router.post("", response_model=ReservationResponse, status_code=201, dependencies=[Depends(require_permission("pos:access"))])
-async def create_reservation(data: ReservationCreate, db: AsyncSession = Depends(get_db)):
-    return await ReservationService.create_reservation(db, data)
+@router.post("", response_model=ReservationResponse, status_code=201)
+async def create_reservation(
+    data: ReservationCreate,
+    current_user: User = Depends(require_permission("pos:access")),
+    db: AsyncSession = Depends(get_db),
+):
+    return await ReservationService.create_reservation(db, data, tenant_id=current_user.tenant_id)
 
 
 @router.post("/{id}/checkin", response_model=ReservationResponse)
@@ -241,6 +268,7 @@ async def checkin_reservation(
     data: Optional[ReservationCheckInRequest] = None,
     db: AsyncSession = Depends(get_db),
     token: Optional[str] = Header(None, alias="Authorization"),
+    current_tenant: Tenant = Depends(get_current_tenant),
 ):
     # ponytail: allow check-in but strip customer PII for unauthenticated callers
     session_token = data.session_token if data else None
@@ -251,13 +279,15 @@ async def checkin_reservation(
         try:
             auth_token = token[7:].strip() if token.lower().startswith("bearer ") else token.strip()
             from app.api.deps import get_current_user
-            user = await get_current_user(db=db, token=auth_token)
+            user = await get_current_user(db=db, token=auth_token, current_tenant=current_tenant)
             if user:
                 is_staff = True
         except Exception:
             is_staff = False
 
-    saved = await ReservationService.checkin_reservation(db, id, session_token, table_id)
+    saved = await ReservationService.checkin_reservation(
+        db, id, session_token, table_id, tenant_id=current_tenant.id
+    )
     resp = ReservationService.sanitize_reservation_response(saved)
     if not is_staff and resp.customer:
         resp.customer.phone = None
@@ -268,13 +298,14 @@ async def checkin_reservation(
 @router.get("/policies/config")
 async def get_policies_config(
     db: AsyncSession = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
 ):
     """
     Returns current owner-configurable policies for deposits, remainders, and cancellations.
     """
-    deposit = await SettingsService.get_deposit_per_guest(db)
-    remainder = await SettingsService.get_deposit_remainder_policy(db)
-    cancellation = await SettingsService.get_cancellation_policy(db)
+    deposit = await SettingsService.get_deposit_per_guest(db, tenant_id=current_tenant.id)
+    remainder = await SettingsService.get_deposit_remainder_policy(db, tenant_id=current_tenant.id)
+    cancellation = await SettingsService.get_cancellation_policy(db, tenant_id=current_tenant.id)
     return {
         "deposit_per_person": deposit,
         "remainder_policy": remainder,
@@ -291,26 +322,42 @@ async def update_policies_config(
     """
     Updates owner policies from POS/Owner Settings.
     """
+    t_id = current_user.tenant_id
     if data.deposit_per_person is not None:
-        await SettingsService.set_setting(db, "RESERVATION_DEPOSIT_PER_PERSON", str(data.deposit_per_person))
+        await SettingsService.set_setting(db, "RESERVATION_DEPOSIT_PER_PERSON", str(data.deposit_per_person), tenant_id=t_id)
     if data.remainder_policy is not None:
-        await SettingsService.set_setting(db, "RESERVATION_DEPOSIT_REMAINDER_POLICY", data.remainder_policy)
+        await SettingsService.set_setting(db, "RESERVATION_DEPOSIT_REMAINDER_POLICY", data.remainder_policy, tenant_id=t_id)
     if data.cancellation_policy is not None:
-        await SettingsService.set_setting(db, "CANCELLATION_REFUND_POLICY", data.cancellation_policy)
+        await SettingsService.set_setting(db, "CANCELLATION_REFUND_POLICY", data.cancellation_policy, tenant_id=t_id)
     if data.cancellation_cutoff_hours is not None:
-        await SettingsService.set_setting(db, "CANCELLATION_CUTOFF_HOURS", str(data.cancellation_cutoff_hours))
+        await SettingsService.set_setting(db, "CANCELLATION_CUTOFF_HOURS", str(data.cancellation_cutoff_hours), tenant_id=t_id)
     if data.cancellation_refund_percentage is not None:
-        await SettingsService.set_setting(db, "CANCELLATION_REFUND_PERCENTAGE", str(data.cancellation_refund_percentage))
+        await SettingsService.set_setting(db, "CANCELLATION_REFUND_PERCENTAGE", str(data.cancellation_refund_percentage), tenant_id=t_id)
     if data.no_show_policy is not None:
-        await SettingsService.set_setting(db, "NO_SHOW_POLICY", data.no_show_policy)
+        await SettingsService.set_setting(db, "NO_SHOW_POLICY", data.no_show_policy, tenant_id=t_id)
 
-    return await get_policies_config(db)
+    deposit = await SettingsService.get_deposit_per_guest(db, tenant_id=t_id)
+    remainder = await SettingsService.get_deposit_remainder_policy(db, tenant_id=t_id)
+    cancellation = await SettingsService.get_cancellation_policy(db, tenant_id=t_id)
+    return {
+        "deposit_per_person": deposit,
+        "remainder_policy": remainder,
+        "cancellation": cancellation,
+    }
 
 
-@router.get("/{id}", response_model=ReservationResponse, dependencies=[Depends(require_permission("pos:access"))])
-async def get_reservation(id: int = Path(...), db: AsyncSession = Depends(get_db)):
+@router.get("/{id}", response_model=ReservationResponse)
+async def get_reservation(
+    id: int = Path(...),
+    current_user: User = Depends(require_permission("pos:access")),
+    db: AsyncSession = Depends(get_db),
+):
     from sqlalchemy.orm import selectinload
-    stmt = select(Reservation).options(selectinload(Reservation.customer)).where(Reservation.id == id)
+    stmt = (
+        select(Reservation)
+        .options(selectinload(Reservation.customer))
+        .where(Reservation.id == id, Reservation.tenant_id == current_user.tenant_id)
+    )
     res = await db.execute(stmt)
     reservation = res.scalar_one_or_none()
     if not reservation:
@@ -318,34 +365,54 @@ async def get_reservation(id: int = Path(...), db: AsyncSession = Depends(get_db
     return ReservationService.sanitize_reservation_response(reservation)
 
 
-@router.patch("/{id}", response_model=ReservationResponse, dependencies=[Depends(require_permission("pos:access"))])
-async def update_reservation(id: int, data: ReservationUpdate, db: AsyncSession = Depends(get_db)):
-    return await ReservationService.update_reservation(db, id, data)
+@router.patch("/{id}", response_model=ReservationResponse)
+async def update_reservation(
+    id: int,
+    data: ReservationUpdate,
+    current_user: User = Depends(require_permission("pos:access")),
+    db: AsyncSession = Depends(get_db),
+):
+    return await ReservationService.update_reservation(db, id, data, tenant_id=current_user.tenant_id)
 
 
-@router.patch("/{id}/status", response_model=ReservationResponse, dependencies=[Depends(require_permission("pos:access"))])
-async def update_reservation_status(id: int, data: ReservationStatusUpdate, db: AsyncSession = Depends(get_db)):
-    return await ReservationService.update_reservation_status(db, id, data.status)
+@router.patch("/{id}/status", response_model=ReservationResponse)
+async def update_reservation_status(
+    id: int,
+    data: ReservationStatusUpdate,
+    current_user: User = Depends(require_permission("pos:access")),
+    db: AsyncSession = Depends(get_db),
+):
+    return await ReservationService.update_reservation_status(db, id, data.status, tenant_id=current_user.tenant_id)
 
 
-@router.delete("/{id}", response_model=ReservationResponse, dependencies=[Depends(require_permission("pos:access"))])
-async def cancel_reservation(id: int, db: AsyncSession = Depends(get_db)):
-    return await ReservationService.cancel_reservation(db, id)
+@router.delete("/{id}", response_model=ReservationResponse)
+async def cancel_reservation(
+    id: int,
+    current_user: User = Depends(require_permission("pos:access")),
+    db: AsyncSession = Depends(get_db),
+):
+    return await ReservationService.cancel_reservation(db, id, tenant_id=current_user.tenant_id)
 
 
-@router.get("", response_model=List[ReservationResponse], dependencies=[Depends(require_permission("pos:access"))])
+@router.get("", response_model=List[ReservationResponse])
 async def list_reservations(
     branch_id: Optional[int] = Query(None),
     reservation_date: Optional[date] = Query(None),
     status: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
+    current_user: User = Depends(require_permission("pos:access")),
     db: AsyncSession = Depends(get_db),
 ):
     from sqlalchemy.orm import selectinload
     from sqlalchemy import or_
     from app.models.customer import Customer
 
-    query = select(Reservation).join(Reservation.customer).options(selectinload(Reservation.customer))
+    query = (
+        select(Reservation)
+        .join(Reservation.customer)
+        .options(selectinload(Reservation.customer))
+        .where(Reservation.tenant_id == current_user.tenant_id)
+    )
     if branch_id:
         query = query.where(Reservation.branch_id == branch_id)
     if reservation_date:
@@ -393,11 +460,14 @@ async def list_reservations(
 
 
 @router.get("/razorpay/config")
-async def get_razorpay_config(db: AsyncSession = Depends(get_db)):
+async def get_razorpay_config(
+    db: AsyncSession = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
+):
     """
     Returns Razorpay key and settings for test mode / frontend integration.
     """
-    deposit = await SettingsService.get_deposit_per_guest(db)
+    deposit = await SettingsService.get_deposit_per_guest(db, tenant_id=current_tenant.id)
     if deposit <= 0:
         deposit = 150.0
     return {
@@ -405,31 +475,42 @@ async def get_razorpay_config(db: AsyncSession = Depends(get_db)):
         "is_test_mode": settings.APP_ENV == "development" or settings.ALLOW_TEST_PAYMENTS,
         "currency": "INR",
         "deposit_per_guest": float(deposit),
-        "merchant_name": "Jaadoo Pizza Project",
-        "description": "Artisanal Table Reservation Deposit",
+        "merchant_name": current_tenant.name or "Jaadoo Pizza Project",
+        "description": f"{current_tenant.name or 'Artisanal'} Table Reservation Deposit",
     }
 
 
 @router.post("/razorpay/create-order", response_model=RazorpayCreateOrderResponse, status_code=201)
-async def create_razorpay_order(data: RazorpayCreateOrderRequest, db: AsyncSession = Depends(get_db)):
+async def create_razorpay_order(
+    data: RazorpayCreateOrderRequest,
+    db: AsyncSession = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
+):
     """
     Generates a Razorpay Order ID for table reservation advance deposit.
     """
-    return await ReservationService.create_razorpay_order(db, data)
+    return await ReservationService.create_razorpay_order(db, data, tenant_id=current_tenant.id)
 
 
 @router.post("/razorpay/verify-payment", response_model=ReservationResponse, status_code=201)
-async def verify_razorpay_payment(data: RazorpayVerifyPaymentRequest, db: AsyncSession = Depends(get_db)):
+async def verify_razorpay_payment(
+    data: RazorpayVerifyPaymentRequest,
+    db: AsyncSession = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
+):
     """
     Verifies Razorpay payment and confirms reservation with instant pass generation.
     """
-    return await ReservationService.verify_razorpay_payment(db, data)
+    return await ReservationService.verify_razorpay_payment(db, data, tenant_id=current_tenant.id)
 
 
-@router.get("/razorpay/transactions", dependencies=[Depends(require_permission("pos:access"))])
-async def list_razorpay_transactions(db: AsyncSession = Depends(get_db)):
+@router.get("/razorpay/transactions")
+async def list_razorpay_transactions(
+    current_user: User = Depends(require_permission("pos:access")),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Returns recent Razorpay payments and simulations for the Admin Testing Portal.
     """
-    return await ReservationService.get_razorpay_transactions(db)
+    return await ReservationService.get_razorpay_transactions(db, tenant_id=current_user.tenant_id)
 

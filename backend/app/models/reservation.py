@@ -1,6 +1,8 @@
 import datetime
 from decimal import Decimal
+import uuid
 from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Time, Numeric
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 from app.utils.helpers import utc_now
@@ -10,6 +12,13 @@ class Reservation(Base):
     __tablename__ = "reservations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        default=uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210"),
+        nullable=False,
+        index=True,
+    )
     branch_id: Mapped[int] = mapped_column(Integer, ForeignKey("branches.id", ondelete="CASCADE"), nullable=False)
     customer_id: Mapped[int] = mapped_column(Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False)
     guest_count: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
@@ -38,6 +47,7 @@ class Reservation(Base):
     branch = relationship("Branch", back_populates="reservations")
     customer = relationship("Customer", back_populates="reservations")
     table = relationship("Table", foreign_keys=[table_id], lazy="selectin")
+    tenant = relationship("Tenant", foreign_keys=[tenant_id])
 
     @property
     def booking_id(self) -> str:
@@ -60,6 +70,13 @@ class ReservationCapacityRule(Base):
     __tablename__ = "reservation_capacity_rules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        default=uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210"),
+        nullable=False,
+        index=True,
+    )
     branch_id: Mapped[int] = mapped_column(Integer, ForeignKey("branches.id", ondelete="CASCADE"), nullable=False)
     time_slot: Mapped[str] = mapped_column(String(20), nullable=False)
     max_guest_capacity: Mapped[int] = mapped_column(Integer, nullable=False, default=80)

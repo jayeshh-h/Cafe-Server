@@ -1,8 +1,11 @@
 import logging
+import uuid
+from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.table import Table, TableQR
 from app.models.branch import Branch
+from app.models.tenant import Tenant
 
 logger = logging.getLogger("cafe_piza.init_tables")
 
@@ -28,15 +31,29 @@ DEFAULT_TABLES = [
 ]
 
 
-async def ensure_default_tables(db: AsyncSession) -> None:
+async def ensure_default_tables(db: AsyncSession, tenant_id: Optional[uuid.UUID] = None) -> None:
     """
     Idempotently ensures default tables (1 to 13) and their secure TableQR tokens
     exist in the database across all environments (Render / Local).
     """
-    branch_res = await db.execute(select(Branch))
+    target_tenant_id = tenant_id
+    if not target_tenant_id:
+        t_res = await db.execute(select(Tenant).where(Tenant.slug == "restrova-default"))
+        t = t_res.scalar_one_or_none()
+        if not t:
+            t_res = await db.execute(select(Tenant))
+            t = t_res.scalar_one_or_none()
+        target_tenant_id = t.id if t else uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
+
+    branch_res = await db.execute(select(Branch).where(Branch.tenant_id == target_tenant_id))
     branch = branch_res.scalar_one_or_none()
     if not branch:
-        branch = Branch(name="Jaadoo Udaipur", address="32 Sitaphal ki gali, Ganesh Ghati, Udaipur", phone="+919876543210")
+        branch = Branch(
+            tenant_id=target_tenant_id,
+            name="Jaadoo Udaipur",
+            address="32 Sitaphal ki gali, Ganesh Ghati, Udaipur",
+            phone="+919876543210",
+        )
         db.add(branch)
         await db.flush()
     else:
@@ -45,13 +62,14 @@ async def ensure_default_tables(db: AsyncSession) -> None:
     for dt in DEFAULT_TABLES:
         # Check if table exists by ID
         tbl_res = await db.execute(
-            select(Table).where(Table.id == dt["id"])
+            select(Table).where(Table.id == dt["id"], Table.tenant_id == target_tenant_id)
         )
         tbl = tbl_res.scalar_one_or_none()
 
         if not tbl:
             tbl = Table(
                 id=dt["id"],
+                tenant_id=target_tenant_id,
                 branch_id=branch.id,
                 table_number=dt["table_number"],
                 capacity=dt["capacity"],

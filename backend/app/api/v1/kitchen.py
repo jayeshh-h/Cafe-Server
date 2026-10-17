@@ -1,10 +1,11 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.api.deps import get_db, get_current_user, require_permission
+from app.api.deps import get_db, require_permission
 from app.models.user import User
 from app.models.kitchen import KitchenOrder, PrintJob
+from app.models.order import Order
 from app.schemas.kitchen import KitchenOrderResponse, KitchenStatusUpdate
 from app.services.kitchen_service import KitchenService
 
@@ -19,9 +20,14 @@ router = APIRouter(
 async def list_kitchen_orders(
     kitchen_id: Optional[int] = Query(None),
     status: Optional[str] = Query(None),
+    current_user: User = Depends(require_permission("pos:access")),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(KitchenOrder)
+    query = (
+        select(KitchenOrder)
+        .join(Order, KitchenOrder.order_id == Order.id)
+        .where(Order.tenant_id == current_user.tenant_id)
+    )
     if kitchen_id:
         query = query.where(KitchenOrder.kitchen_id == kitchen_id)
     if status:
@@ -43,23 +49,42 @@ async def list_kitchen_orders(
 async def update_kitchen_order_status(
     id: int, 
     data: KitchenStatusUpdate, 
+    current_user: User = Depends(require_permission("pos:access")),
     db: AsyncSession = Depends(get_db),
 ):
+    check_stmt = (
+        select(KitchenOrder)
+        .join(Order, KitchenOrder.order_id == Order.id)
+        .where(KitchenOrder.id == id, Order.tenant_id == current_user.tenant_id)
+    )
+    res = await db.execute(check_stmt)
+    if not res.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Kitchen order not found.")
+
     return await KitchenService.update_kitchen_order_status(db, id, data.status)
 
 
 @router.post("/orders/{id}/retry-print")
 async def retry_print_job(
     id: int, 
+    current_user: User = Depends(require_permission("pos:access")),
     db: AsyncSession = Depends(get_db),
 ):
-    from fastapi import HTTPException
+    check_stmt = (
+        select(KitchenOrder)
+        .join(Order, KitchenOrder.order_id == Order.id)
+        .where(KitchenOrder.id == id, Order.tenant_id == current_user.tenant_id)
+    )
+    res = await db.execute(check_stmt)
+    if not res.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Kitchen order not found.")
+
     query = select(PrintJob).where(PrintJob.kitchen_order_id == id, PrintJob.status == "FAILED")
     result = await db.execute(query)
     jobs = result.scalars().all()
     
     if not jobs:
-        raise HTTPException(status_code=404, detail="No failed print jobs found for this order.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No failed print jobs found for this order.")
         
     for job in jobs:
         job.status = "RETRYING"

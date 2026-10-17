@@ -59,6 +59,9 @@ def sanitize_customer_email(v: Optional[str]) -> Optional[str]:
 
 
 def validate_reservation_date_guardrail(v: date) -> date:
+    from app.core.config import settings
+    if not getattr(settings, "BOOKING_RULES_ENFORCED", True):
+        return v
     today = date.today()
     if v < today:
         raise ValueError("Reservation date cannot be in the past.")

@@ -2,6 +2,7 @@ import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
+import uuid
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +47,7 @@ class POSService:
         db: AsyncSession,
         target_date: Optional[datetime.date] = None,
         limit: int = 100,
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> List[KOTResponse]:
         if not target_date:
             target_date = datetime.date.today()
@@ -58,9 +60,10 @@ class POSService:
                 selectinload(KOT.print_jobs),
             )
             .where(KOT.business_date == target_date)
-            .order_by(KOT.sequence_number.asc())
-            .limit(limit)
         )
+        if tenant_id:
+            stmt = stmt.join(Table, KOT.table_id == Table.id).where(Table.tenant_id == tenant_id)
+        stmt = stmt.order_by(KOT.sequence_number.asc()).limit(limit)
         res = await db.execute(stmt)
         kots = res.scalars().all()
 
@@ -108,6 +111,7 @@ class POSService:
     async def get_summary(
         db: AsyncSession,
         target_date: Optional[datetime.date] = None,
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> POSSummaryResponse:
         if not target_date:
             target_date = datetime.date.today()
@@ -121,8 +125,10 @@ class POSService:
                 .selectinload(MenuItem.category)
             )
             .where(KOT.business_date == target_date)
-            .order_by(KOT.created_at.asc())
         )
+        if tenant_id:
+            stmt = stmt.join(Table, KOT.table_id == Table.id).where(Table.tenant_id == tenant_id)
+        stmt = stmt.order_by(KOT.created_at.asc())
         res = await db.execute(stmt)
         kots = res.scalars().all()
 
@@ -183,6 +189,8 @@ class POSService:
             )
             .where(KOT.business_date == yesterday_date)
         )
+        if tenant_id:
+            yest_stmt = yest_stmt.join(Table, KOT.table_id == Table.id).where(Table.tenant_id == tenant_id)
         yest_res = await db.execute(yest_stmt)
         yest_kots = yest_res.scalars().all()
 
@@ -230,13 +238,19 @@ class POSService:
         )
 
     @staticmethod
-    async def claim_kot_print(db: AsyncSession, kot_id: int, force: bool = False) -> dict:
+    async def claim_kot_print(db: AsyncSession, kot_id: int, force: bool = False, tenant_id: Optional[uuid.UUID] = None) -> dict:
         """Atomically claim a KOT for printing on this device and return the ticket content.
 
         Only one device can claim a KOT (PENDING/FAILED -> PRINTING), so two POS screens with
         auto-print on never print it twice. force=True reprints regardless of status.
         """
         from sqlalchemy import update
+
+        if tenant_id:
+            check_stmt = select(KOT).join(Table, KOT.table_id == Table.id).where(KOT.id == kot_id, Table.tenant_id == tenant_id)
+            c_res = await db.execute(check_stmt)
+            if not c_res.scalar_one_or_none():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="KOT not found.")
 
         stmt = update(KOT).where(KOT.id == kot_id)
         if not force:
@@ -279,7 +293,12 @@ class POSService:
         }
 
     @staticmethod
-    async def mark_kot_printed(db: AsyncSession, kot_id: int, success: bool) -> dict:
+    async def mark_kot_printed(db: AsyncSession, kot_id: int, success: bool, tenant_id: Optional[uuid.UUID] = None) -> dict:
+        if tenant_id:
+            check_stmt = select(KOT).join(Table, KOT.table_id == Table.id).where(KOT.id == kot_id, Table.tenant_id == tenant_id)
+            c_res = await db.execute(check_stmt)
+            if not c_res.scalar_one_or_none():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="KOT not found.")
         kot = await db.get(KOT, kot_id)
         if not kot:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="KOT not found.")
@@ -290,7 +309,13 @@ class POSService:
         return {"kot_id": kot.id, "printed_status": kot.printed_status}
 
     @staticmethod
-    async def retry_kot_print(db: AsyncSession, kot_id: int) -> dict:
+    async def retry_kot_print(db: AsyncSession, kot_id: int, tenant_id: Optional[uuid.UUID] = None) -> dict:
+        if tenant_id:
+            check_stmt = select(KOT).join(Table, KOT.table_id == Table.id).where(KOT.id == kot_id, Table.tenant_id == tenant_id)
+            c_res = await db.execute(check_stmt)
+            if not c_res.scalar_one_or_none():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"KOT #{kot_id} not found.")
+
         stmt = (
             select(KOT)
             .options(
@@ -368,7 +393,7 @@ class POSService:
         }
 
     @staticmethod
-    async def close_dining_session(db: AsyncSession, session_id: int, payment_mode: Optional[str] = None) -> dict:
+    async def close_dining_session(db: AsyncSession, session_id: int, payment_mode: Optional[str] = None, tenant_id: Optional[uuid.UUID] = None) -> dict:
         # ponytail: row lock and idempotency check to prevent duplicate settlements
         stmt = (
             select(DiningSession)
@@ -379,6 +404,9 @@ class POSService:
         res = await db.execute(stmt)
         sess = res.scalar_one_or_none()
         if not sess:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Dining session #{session_id} not found.")
+
+        if tenant_id and sess.table and sess.table.tenant_id != tenant_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Dining session #{session_id} not found.")
 
         if sess.status == "CLOSED":
@@ -442,7 +470,11 @@ class POSService:
         return {"message": f"Dining session #{session_id} settled and closed successfully. Table is now Available."}
 
     @staticmethod
-    async def settle_table_by_id(db: AsyncSession, table_id: int, payment_mode: Optional[str] = None) -> dict:
+    async def settle_table_by_id(db: AsyncSession, table_id: int, payment_mode: Optional[str] = None, tenant_id: Optional[uuid.UUID] = None) -> dict:
+        table = await db.get(Table, table_id)
+        if not table or (tenant_id and table.tenant_id != tenant_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Table #{table_id} not found.")
+
         session_stmt = (
             select(DiningSession)
             .where(
@@ -455,20 +487,24 @@ class POSService:
         res = await db.execute(session_stmt)
         sess = res.scalar_one_or_none()
         if not sess:
-            table = await db.get(Table, table_id)
-            if table:
-                table.status = "Available"
-                await db.commit()
+            table.status = "Available"
+            await db.commit()
             return {"message": f"Table #{table_id} is already Available (no active dining session)."}
 
-        return await POSService.close_dining_session(db, session_id=sess.id, payment_mode=payment_mode)
+        return await POSService.close_dining_session(db, session_id=sess.id, payment_mode=payment_mode, tenant_id=tenant_id)
 
     @staticmethod
-    async def reset_all_sessions(db: AsyncSession) -> dict:
+    async def reset_all_sessions(db: AsyncSession, tenant_id: Optional[uuid.UUID] = None) -> dict:
         """Force reset/close all active dining sessions across all tables."""
-        session_stmt = select(DiningSession).where(
-            DiningSession.status.in_(["OPENED", "ACTIVE", "CHECKOUT"])
+        session_stmt = (
+            select(DiningSession)
+            .join(Table, DiningSession.table_id == Table.id)
+            .where(
+                DiningSession.status.in_(["OPENED", "ACTIVE", "CHECKOUT"])
+            )
         )
+        if tenant_id:
+            session_stmt = session_stmt.where(Table.tenant_id == tenant_id)
         res = await db.execute(session_stmt)
         active_sessions = res.scalars().all()
 
@@ -493,12 +529,16 @@ class POSService:
 
         # Set all tables to Available
         table_stmt = select(Table)
+        if tenant_id:
+            table_stmt = table_stmt.where(Table.tenant_id == tenant_id)
         table_res = await db.execute(table_stmt)
         for tbl in table_res.scalars().all():
             tbl.status = "Available"
 
         # Complete active KOTs
-        kot_stmt = select(KOT).where(KOT.status != "COMPLETED")
+        kot_stmt = select(KOT).join(Table, KOT.table_id == Table.id).where(KOT.status != "COMPLETED")
+        if tenant_id:
+            kot_stmt = kot_stmt.where(Table.tenant_id == tenant_id)
         kot_res = await db.execute(kot_stmt)
         for kot in kot_res.scalars().all():
             kot.status = "COMPLETED"
@@ -519,6 +559,7 @@ class POSService:
     async def get_table_sessions(
         db: AsyncSession,
         target_date: Optional[datetime.date] = None,
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> List[TableOverviewResponse]:
         """Fetch all tables with their chronological dining sessions and ordered items."""
         if not target_date:
@@ -530,13 +571,17 @@ class POSService:
         target_end = datetime.datetime.combine(target_date, datetime.time.max)
 
         # 1. Fetch tables
-        tbl_stmt = select(Table).order_by(Table.id.asc())
+        tbl_stmt = select(Table)
+        if tenant_id:
+            tbl_stmt = tbl_stmt.where(Table.tenant_id == tenant_id)
+        tbl_stmt = tbl_stmt.order_by(Table.id.asc())
         tbl_res = await db.execute(tbl_stmt)
         tables = tbl_res.scalars().all()
 
         # 2. Fetch only active or today/recent sessions in a single targeted query
         session_stmt = (
             select(DiningSession)
+            .join(Table, DiningSession.table_id == Table.id)
             .where(
                 or_(
                     DiningSession.status.in_(["OPENED", "ACTIVE", "CHECKOUT"]),
@@ -546,7 +591,11 @@ class POSService:
                     DiningSession.closed_at.between(target_start, target_end),
                 )
             )
-            .options(
+        )
+        if tenant_id:
+            session_stmt = session_stmt.where(Table.tenant_id == tenant_id)
+        session_stmt = (
+            session_stmt.options(
                 selectinload(DiningSession.orders).selectinload(Order.items).selectinload(OrderItem.menu_item),
                 selectinload(DiningSession.customer),
                 selectinload(DiningSession.reservation),
@@ -752,13 +801,16 @@ class POSService:
         return results
 
     @staticmethod
-    async def merge_tables(db: AsyncSession, source_table_id: int, target_table_id: int) -> dict:
+    async def merge_tables(db: AsyncSession, source_table_id: int, target_table_id: int, tenant_id: Optional[uuid.UUID] = None) -> dict:
         if source_table_id == target_table_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source and target tables must be different.")
 
         source_tbl = await db.get(Table, source_table_id)
         target_tbl = await db.get(Table, target_table_id)
         if not source_tbl or not target_tbl:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source or target table not found.")
+
+        if tenant_id and (source_tbl.tenant_id != tenant_id or target_tbl.tenant_id != tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source or target table not found.")
 
         source_sess_stmt = (
@@ -829,9 +881,10 @@ class POSService:
         table_id: int,
         customer_name: Optional[str] = None,
         guest_count: Optional[int] = None,
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> dict:
         table = await db.get(Table, table_id)
-        if not table:
+        if not table or (tenant_id and table.tenant_id != tenant_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found.")
         if guest_count is not None and table.capacity and guest_count > table.capacity:
             raise HTTPException(
@@ -905,12 +958,17 @@ class POSService:
         db: AsyncSession,
         session_id: int,
         items: List[dict],
+        tenant_id: Optional[uuid.UUID] = None,
     ) -> dict:
         from app.schemas.order import MAX_ITEM_QUANTITY
 
         session = await db.get(DiningSession, session_id)
         if not session:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dining session not found.")
+        if tenant_id:
+            tbl = await db.get(Table, session.table_id)
+            if not tbl or tbl.tenant_id != tenant_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dining session not found.")
         if session.status not in ("OPENED", "ACTIVE", "CHECKOUT"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This bill is already settled and can no longer be edited.")
         if not isinstance(items, list):
@@ -939,7 +997,10 @@ class POSService:
 
         menu_by_id: dict[int, MenuItem] = {}
         if req_by_id:
-            rows = (await db.execute(select(MenuItem).where(MenuItem.id.in_(list(req_by_id)), MenuItem.is_active == True))).scalars().all()
+            m_stmt = select(MenuItem).where(MenuItem.id.in_(list(req_by_id)), MenuItem.is_active == True)
+            if tenant_id:
+                m_stmt = m_stmt.where(MenuItem.tenant_id == tenant_id)
+            rows = (await db.execute(m_stmt)).scalars().all()
             menu_by_id = {m.id: m for m in rows}
             unknown = [str(it.get("name") or f"item #{i}") for i, it in req_by_id.items() if i not in menu_by_id]
             if unknown:
@@ -947,7 +1008,10 @@ class POSService:
         if req_by_name:
             # Older POS screens send only names: resolve them, but never guess between same-named dishes
             # Compare names ignoring stray spaces ("MARINARA " == "Marinara")
-            rows = (await db.execute(select(MenuItem).where(MenuItem.is_active == True))).scalars().all()
+            m_stmt = select(MenuItem).where(MenuItem.is_active == True)
+            if tenant_id:
+                m_stmt = m_stmt.where(MenuItem.tenant_id == tenant_id)
+            rows = (await db.execute(m_stmt)).scalars().all()
             for key, it in req_by_name.items():
                 matches = [m for m in rows if " ".join(m.name.split()).lower() == key]
                 if not matches:

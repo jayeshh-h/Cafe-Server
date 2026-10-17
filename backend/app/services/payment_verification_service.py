@@ -1,4 +1,5 @@
 import datetime
+import uuid
 from decimal import Decimal
 from typing import Optional, Union, List, Dict, Any
 from sqlalchemy import select, func, or_
@@ -32,13 +33,16 @@ class PaymentVerificationService:
         event_id: Optional[str] = None,
         raw_event_payload: Optional[str] = None,
         review_reason: Optional[str] = None,
+        tenant_id: Optional[Union[uuid.UUID, str]] = None,
     ) -> VerifiedBankCredit:
         """
         Records an authentic bank credit received from a bank acquirer, payment gateway webhook,
         Android phone notification listener, or staff bank statement reconciliation.
         """
+        import uuid as _uuid
         clean_utr = utr.strip().replace(" ", "").replace("-", "")
         dec_amount = Decimal(str(amount))
+        t_id = _uuid.UUID(str(tenant_id)) if tenant_id else _uuid.UUID("23395d5e-16e5-4eb6-9214-cc63f05c3210")
 
         # Check existing by event_id if provided
         if event_id:
@@ -59,6 +63,7 @@ class PaymentVerificationService:
             return existing
 
         credit = VerifiedBankCredit(
+            tenant_id=t_id,
             utr=clean_utr,
             amount=dec_amount,
             merchant_vpa=merchant_vpa,
@@ -74,7 +79,7 @@ class PaymentVerificationService:
         await db.commit()
         await db.refresh(credit)
         logger.info(
-            f"Verified bank credit recorded: UTR={clean_utr} Amount={dec_amount} Source={provider_source} Status={tx_status}"
+            f"Verified bank credit recorded: UTR={clean_utr} Amount={dec_amount} Source={provider_source} Status={tx_status} Tenant={t_id}"
         )
         return credit
 
@@ -91,16 +96,19 @@ class PaymentVerificationService:
         """
         clean_utr = utr.strip().replace(" ", "").replace("-", "")
 
-        # 1. Query verified bank credits with atomic row-level lock
+        # 1. Query verified bank credits with atomic row-level lock and tenant isolation barrier
         stmt = (
             select(VerifiedBankCredit)
-            .where(func.lower(VerifiedBankCredit.utr) == clean_utr.lower())
+            .where(
+                func.lower(VerifiedBankCredit.utr) == clean_utr.lower(),
+                VerifiedBankCredit.tenant_id == reservation.tenant_id,
+            )
             .with_for_update()
         )
         res = await db.execute(stmt)
         credit = res.scalars().first()
 
-        # 2. Strict rejection: No genuine bank credit exists for this UTR
+        # 2. Strict rejection: No genuine bank credit exists for this UTR for this tenant
         if not credit:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -185,9 +193,22 @@ class PaymentVerificationService:
                 "payment_status": existing_credit.status,
             }
 
-        # 2. Validate Merchant UPI ID
-        is_valid_merchant = merchant_vpa.lower() == settings.MERCHANT_UPI_ID.lower()
-        if not is_valid_merchant:
+        # 2. Resolve Tenant from receiving merchant_vpa or default settings
+        clean_vpa = (merchant_vpa or "").strip().lower()
+        from app.models.tenant import Tenant
+        matched_tenant = None
+        if clean_vpa:
+            tenant_stmt = select(Tenant).where(
+                func.lower(Tenant.merchant_upi_id) == clean_vpa
+            )
+            matched_tenant = (await db.execute(tenant_stmt)).scalars().first()
+
+        if not matched_tenant:
+            def_stmt = select(Tenant).where(Tenant.slug == "restrova-default")
+            matched_tenant = (await db.execute(def_stmt)).scalars().first()
+
+        target_tenant_id = matched_tenant.id if matched_tenant else None
+        if not target_tenant_id:
             credit = await PaymentVerificationService.record_verified_bank_credit(
                 db=db,
                 utr=clean_utr,
@@ -197,7 +218,7 @@ class PaymentVerificationService:
                 payer_vpa=payer_vpa,
                 tx_status="PAYMENT_REVIEW_REQUIRED",
                 event_id=event_id,
-                review_reason=f"INVALID_MERCHANT_VPA: Payment received on '{merchant_vpa}', expected '{settings.MERCHANT_UPI_ID}'.",
+                review_reason=f"UNKNOWN_MERCHANT_VPA: Payment received on '{merchant_vpa}' does not belong to any active café.",
             )
             return {
                 "status": "PAYMENT_REVIEW_REQUIRED",
@@ -205,11 +226,12 @@ class PaymentVerificationService:
                 "reason": credit.review_reason,
             }
 
-        # 3. Look for pending reservation waiting for this exact UTR
+        # 3. Look for pending reservation waiting for this exact UTR within this tenant
         utr_res_stmt = (
             select(Reservation)
             .options(selectinload(Reservation.customer))
             .where(
+                Reservation.tenant_id == target_tenant_id,
                 Reservation.status == "PAYMENT_PENDING",
                 func.lower(Reservation.upi_utr) == clean_utr.lower(),
             )
@@ -218,12 +240,13 @@ class PaymentVerificationService:
         utr_res = await db.execute(utr_res_stmt)
         matched_res = utr_res.scalars().first()
 
-        # 4. If no exact UTR match, look for reservations in HOLD or PAYMENT_PENDING with matching deposit amount
+        # 4. If no exact UTR match, look for reservations in HOLD or PAYMENT_PENDING with matching deposit amount for this tenant
         if not matched_res:
             candidates_stmt = (
                 select(Reservation)
                 .options(selectinload(Reservation.customer))
                 .where(
+                    Reservation.tenant_id == target_tenant_id,
                     Reservation.status.in_(["HOLD", "PAYMENT_PENDING"]),
                     Reservation.advance_amount == dec_amount,
                     Reservation.hold_expires_at > now,
@@ -237,7 +260,7 @@ class PaymentVerificationService:
             if len(candidates) == 1:
                 matched_res = candidates[0]
             elif len(candidates) > 1:
-                # Ambiguous: Multiple reservations waiting for this exact amount
+                # Ambiguous: Multiple reservations waiting for this exact amount for this tenant
                 credit = await PaymentVerificationService.record_verified_bank_credit(
                     db=db,
                     utr=clean_utr,
@@ -247,6 +270,7 @@ class PaymentVerificationService:
                     payer_vpa=payer_vpa,
                     tx_status="PAYMENT_REVIEW_REQUIRED",
                     event_id=event_id,
+                    tenant_id=target_tenant_id,
                     review_reason=f"AMBIGUOUS_MATCH: {len(candidates)} active reservations found waiting for ₹{dec_amount}. Staff must assign.",
                 )
                 return {
@@ -255,9 +279,10 @@ class PaymentVerificationService:
                     "reason": credit.review_reason,
                 }
 
-        # 5. Check if money arrived after HOLD expired
+        # 5. Check if money arrived after HOLD expired for this tenant
         if not matched_res:
             expired_stmt = select(Reservation).where(
+                Reservation.tenant_id == target_tenant_id,
                 Reservation.status == "EXPIRED",
                 or_(
                     func.lower(Reservation.upi_utr) == clean_utr.lower(),
@@ -276,6 +301,7 @@ class PaymentVerificationService:
                 payer_vpa=payer_vpa,
                 tx_status="PAYMENT_REVIEW_REQUIRED",
                 event_id=event_id,
+                tenant_id=target_tenant_id,
                 review_reason=(
                     f"LATE_PAYMENT_OR_NO_MATCH: Money arrived for UTR '{clean_utr}' (₹{dec_amount}) but no active hold was found. "
                     f"Associated expired reservation: #{expired_res.id if expired_res else 'None'}."
@@ -299,6 +325,7 @@ class PaymentVerificationService:
                 payer_vpa=payer_vpa,
                 tx_status="PAYMENT_REVIEW_REQUIRED",
                 event_id=event_id,
+                tenant_id=target_tenant_id,
                 review_reason=f"UNDERPAID: Received ₹{dec_amount}, required ₹{req_advance}.",
             )
             return {
@@ -317,6 +344,7 @@ class PaymentVerificationService:
             payer_vpa=payer_vpa,
             tx_status="SETTLED",
             event_id=event_id,
+            tenant_id=target_tenant_id,
         )
 
         credit.is_claimed = True
