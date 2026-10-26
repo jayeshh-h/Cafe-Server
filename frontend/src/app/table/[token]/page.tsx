@@ -149,9 +149,23 @@ export default function TableQRPage({ params }: { params: Promise<{ token: strin
     let ws: WebSocket | null = null;
     let reconnectTimeout: any = null;
 
+    const getWsBase = () => {
+      if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL.replace(/\/$/, "");
+      if (typeof window !== "undefined") {
+        const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+        if (isLocal) {
+          return "ws://127.0.0.1:8000";
+        }
+        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        return `${proto}//${window.location.host}`;
+      }
+      return "";
+    };
+
     const connectWS = () => {
       try {
-        const wsBase = process.env.NEXT_PUBLIC_WS_URL || "wss://cafe-piza-api.onrender.com";
+        const wsBase = getWsBase();
+        if (!wsBase) return;
         ws = new WebSocket(`${wsBase}/ws/menu`);
 
         ws.onmessage = (event) => {

@@ -26,3 +26,49 @@ async def test_qr_isolation_unauthenticated_checkout_rejected(db_session):
         assert response.status_code == 401
 
     app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_cors_trusted_and_untrusted_origins():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. Trusted Restrova subdomain
+        res1 = await client.options(
+            "/health",
+            headers={
+                "Origin": "https://tenant-cafe.restrova.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert res1.headers.get("access-control-allow-origin") == "https://tenant-cafe.restrova.com"
+        assert res1.headers.get("access-control-allow-credentials") == "true"
+
+        # 2. Trusted apex domain
+        res2 = await client.options(
+            "/health",
+            headers={
+                "Origin": "https://restrova.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert res2.headers.get("access-control-allow-origin") == "https://restrova.com"
+
+        # 3. Trusted staging subdomain
+        res3 = await client.options(
+            "/health",
+            headers={
+                "Origin": "https://staging.restrova.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert res3.headers.get("access-control-allow-origin") == "https://staging.restrova.com"
+
+        # 4. Untrusted malicious origin
+        res4 = await client.options(
+            "/health",
+            headers={
+                "Origin": "https://malicious-phishing.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert "access-control-allow-origin" not in res4.headers

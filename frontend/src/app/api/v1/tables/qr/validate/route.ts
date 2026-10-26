@@ -1,9 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getStoredQrs } from "@/lib/generalizedQrStore";
+import { getUpstreamUrl } from "@/lib/upstream";
 
 // ponytail: Robust QR validator that supports both table-specific and generalized QR codes
 export async function POST(req: NextRequest) {
-  const upstream = (process.env.API_UPSTREAM_URL || "https://cafe-piza-api.onrender.com").replace(/\/$/, "");
+  const upstream = getUpstreamUrl();
+  if (!upstream) {
+    return NextResponse.json({ detail: "API upstream is not configured." }, { status: 502 });
+  }
 
   try {
     const body = await req.json();

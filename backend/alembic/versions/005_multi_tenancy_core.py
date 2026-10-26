@@ -138,20 +138,10 @@ def upgrade() -> None:
     bind.execute(sa.text("ALTER TABLE IF EXISTS users DROP CONSTRAINT IF EXISTS users_username_key;"))
     bind.execute(sa.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_tenant_username ON users (tenant_id, username);"))
 
-    # Disambiguate any duplicate table numbers within tenant before adding unique constraint
-    bind.execute(sa.text("""
-        WITH numbered AS (
-            SELECT id, ROW_NUMBER() OVER (ORDER BY id) as rn
-            FROM tables
-        )
-        UPDATE tables
-        SET table_number = 'Table ' || numbered.rn
-        FROM numbered
-        WHERE tables.id = numbered.id;
-    """))
+    # Tables: ensure non-unique lookup index on tenant tables without restricting multi-floor identical table numbers
     bind.execute(sa.text("ALTER TABLE IF EXISTS tables DROP CONSTRAINT IF EXISTS tables_table_number_key;"))
     bind.execute(sa.text("DROP INDEX IF EXISTS ix_tables_table_number;"))
-    bind.execute(sa.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_tables_tenant_number ON tables (tenant_id, table_number);"))
+    bind.execute(sa.text("CREATE INDEX IF NOT EXISTS idx_tables_tenant_lookup ON tables (tenant_id, branch_id, table_number);"))
 
     bind.execute(sa.text("ALTER TABLE IF EXISTS menu_categories DROP CONSTRAINT IF EXISTS menu_categories_name_key;"))
     bind.execute(sa.text("DROP INDEX IF EXISTS ix_menu_categories_name;"))
@@ -175,8 +165,7 @@ def downgrade() -> None:
         pass
 
     try:
-        op.drop_constraint('uq_tables_tenant_number', 'tables', type_='unique')
-        op.create_unique_constraint('tables_table_number_key', 'tables', ['table_number'])
+        op.drop_index('idx_tables_tenant_lookup', table_name='tables')
     except Exception:
         pass
 

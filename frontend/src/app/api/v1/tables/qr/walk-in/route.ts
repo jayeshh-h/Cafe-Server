@@ -1,9 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { formatBookingId } from "@/lib/bookingId";
+import { getUpstreamUrl } from "@/lib/upstream";
 
 // ponytail: direct walk-in registration proxy with graceful fallback
 export async function POST(req: NextRequest) {
-  const upstream = (process.env.API_UPSTREAM_URL || "https://cafe-piza-api.onrender.com").replace(/\/$/, "");
+  const upstream = getUpstreamUrl();
+  if (!upstream) {
+    return NextResponse.json({ detail: "API upstream is not configured." }, { status: 502 });
+  }
 
   try {
     const body = await req.json();

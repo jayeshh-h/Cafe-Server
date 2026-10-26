@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { toggleStoredQrStatus } from "@/lib/generalizedQrStore";
+import { getUpstreamUrl } from "@/lib/upstream";
 
 // ponytail: Toggle generalized QR status with upstream proxy and high-availability fallback
 export async function POST(req: NextRequest) {
-  const upstream = (process.env.API_UPSTREAM_URL || "https://cafe-piza-api.onrender.com").replace(/\/$/, "");
+  const upstream = getUpstreamUrl();
   const authHeader = req.headers.get("authorization");
 
   if (!authHeader) {

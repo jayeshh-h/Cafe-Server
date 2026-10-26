@@ -512,12 +512,13 @@ export default function KunalManagerPortal() {
         const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
         return `${proto}//${window.location.host}`;
       }
-      return "wss://cafe-piza-api.onrender.com";
+      return "";
     };
 
     const connectWs = () => {
       setSyncStatus("connecting");
       const wsBase = getWsBase();
+      if (!wsBase) return;
       // Directly targets the FastAPI root mount @router.websocket("/ws/{channel}")
       const wsUrl = `${wsBase}/ws/admin`;
 

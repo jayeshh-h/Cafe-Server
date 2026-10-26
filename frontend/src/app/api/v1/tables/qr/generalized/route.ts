@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getStoredQrs, addStoredQr } from "@/lib/generalizedQrStore";
+import { getUpstreamUrl } from "@/lib/upstream";
 
 // ponytail: Generalized QR hub endpoint with upstream proxy and high-availability fallback
 export async function GET(req: NextRequest) {
-  const upstream = (process.env.API_UPSTREAM_URL || "https://cafe-piza-api.onrender.com").replace(/\/$/, "");
+  const upstream = getUpstreamUrl();
   const authHeader = req.headers.get("authorization");
 
   if (!authHeader) {
@@ -61,7 +62,7 @@ export async function GET(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  const upstream = (process.env.API_UPSTREAM_URL || "https://cafe-piza-api.onrender.com").replace(/\/$/, "");
+  const upstream = getUpstreamUrl();
   const authHeader = req.headers.get("authorization");
 
   if (!authHeader) {

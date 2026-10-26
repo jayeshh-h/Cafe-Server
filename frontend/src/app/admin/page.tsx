@@ -404,7 +404,16 @@ export default function AdminPortal() {
   };
 
   const getWsBase = () => {
-    return process.env.NEXT_PUBLIC_WS_URL || "wss://cafe-piza-api.onrender.com";
+    if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL.replace(/\/$/, "");
+    if (typeof window !== "undefined") {
+      const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+      if (isLocal) {
+        return "ws://127.0.0.1:8000";
+      }
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      return `${proto}//${window.location.host}`;
+    }
+    return "";
   };
 
   // Raw material inventory
@@ -1382,7 +1391,7 @@ export default function AdminPortal() {
     let reconnectTimeout: any = null;
 
     const connectAll = () => {
-      if (isCleanedUp) return;
+      if (isCleanedUp || !wsBase) return;
       channels.forEach((ch) => {
         try {
           const ws = new WebSocket(`${wsBase}/ws/${ch}`);

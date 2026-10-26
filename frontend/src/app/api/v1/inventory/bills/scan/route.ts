@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getUpstreamUrl } from "@/lib/upstream";
 
 const EXTRACT_SCHEMA = {
   type: "object",
@@ -189,7 +190,7 @@ export async function POST(req: NextRequest) {
 
   const sarvamKey = process.env.SARVAM_API_KEY;
   const baseUrl = (process.env.SARVAM_BASE_URL || "https://api.sarvam.ai").replace(/\/$/, "");
-  const upstream = (process.env.API_UPSTREAM_URL || "https://cafe-piza-api.onrender.com").replace(/\/$/, "");
+  const upstream = getUpstreamUrl();
 
   try {
     const formData = await req.formData();

@@ -79,7 +79,7 @@ origins = settings.CORS_ORIGINS if isinstance(settings.CORS_ORIGINS, list) else 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://([a-zA-Z0-9-]+\.)*(vercel\.app|onrender\.com)$",
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://([a-zA-Z0-9-]+\.)*(restrova\.com|vercel\.app|onrender\.com)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -161,10 +161,10 @@ async def on_startup():
     import app.models
     from app.core.database import Base, engine
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            is_sqlite = "sqlite" in settings.DATABASE_URL
-            if is_sqlite:
+        is_sqlite = "sqlite" in settings.DATABASE_URL.lower()
+        if is_sqlite:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
                 res_cols = await conn.execute(text("PRAGMA table_info(reservations)"))
                 cols = [c[1] for c in res_cols.fetchall()]
                 if "table_id" not in cols:
@@ -197,7 +197,6 @@ async def on_startup():
                     await conn.execute(text("ALTER TABLE reservations ADD COLUMN cancellation_refund_status VARCHAR(30)"))
                 if "expected_pizza_count" not in cols:
                     await conn.execute(text("ALTER TABLE reservations ADD COLUMN expected_pizza_count INTEGER"))
-
 
                 sess_cols = await conn.execute(text("PRAGMA table_info(dining_sessions)"))
                 s_cols = [c[1] for c in sess_cols.fetchall()]
@@ -247,63 +246,9 @@ async def on_startup():
                     await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN is_claimed BOOLEAN DEFAULT 0"))
                 if "claimed_reservation_id" not in v_cols:
                     await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN claimed_reservation_id INTEGER"))
-            else:
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS table_id INTEGER"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS floor_number INTEGER DEFAULT 1"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS table_name VARCHAR(50)"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_status VARCHAR(20) DEFAULT 'PAID'"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS advance_amount NUMERIC(10, 2) DEFAULT 0.00"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_reference VARCHAR(64)"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS payment_method VARCHAR(30)"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS hold_expires_at TIMESTAMP WITHOUT TIME ZONE"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS upi_id VARCHAR(100)"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS upi_utr VARCHAR(100)"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS is_deposit_credited BOOLEAN DEFAULT FALSE"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS credited_bill_id INTEGER"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_refund_amount NUMERIC(10, 2) DEFAULT 0.00"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS cancellation_refund_status VARCHAR(30)"))
-                await conn.execute(text("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS expected_pizza_count INTEGER"))
-
-
-                await conn.execute(text("ALTER TABLE dining_sessions ADD COLUMN IF NOT EXISTS reservation_id INTEGER"))
-                await conn.execute(text("ALTER TABLE dining_sessions ADD COLUMN IF NOT EXISTS allergy_info VARCHAR(500)"))
-                await conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS allergy_info VARCHAR(500)"))
-                await conn.execute(text("ALTER TABLE kots ADD COLUMN IF NOT EXISTS allergy_info VARCHAR(500)"))
-                await conn.execute(text("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS image_url VARCHAR(255)"))
-                await conn.execute(text("ALTER TABLE tables ADD COLUMN IF NOT EXISTS floor INTEGER"))
-                # Tidy dish names: no leading/trailing or double spaces ("MARINARA " broke name matching)
-                await conn.execute(text(
-                    r"UPDATE menu_items SET name = regexp_replace(btrim(name), '\s+', ' ', 'g') "
-                    r"WHERE name <> regexp_replace(btrim(name), '\s+', ' ', 'g')"
-                ))
-
-                await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS reservation_deposit_paid NUMERIC(12, 2) DEFAULT 0.00"))
-                await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS reservation_credit NUMERIC(12, 2) DEFAULT 0.00"))
-                await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS remainder_action VARCHAR(30)"))
-                await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS remainder_amount NUMERIC(12, 2) DEFAULT 0.00"))
-                await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS discount_type VARCHAR(10)"))
-                await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS discount_value NUMERIC(12, 2) NOT NULL DEFAULT 0.00"))
-                await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS discount_reason VARCHAR(200)"))
-                await conn.execute(text("ALTER TABLE bills ADD COLUMN IF NOT EXISTS discount_by_user_id INTEGER"))
-                await conn.execute(text("ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS invoice_number VARCHAR(100)"))
-                await conn.execute(text("ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS invoice_date DATE"))
-
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS event_id VARCHAR(100)"))
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS raw_event_payload VARCHAR(500)"))
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS review_reason VARCHAR(200)"))
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS is_claimed BOOLEAN DEFAULT FALSE"))
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS claimed_reservation_id INTEGER"))
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS merchant_vpa VARCHAR(100) DEFAULT '9460555743-2@ybl'"))
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS payer_vpa VARCHAR(100)"))
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS provider_source VARCHAR(50) DEFAULT 'ANDROID_LISTENER'"))
-                await conn.execute(text("ALTER TABLE verified_bank_credits ADD COLUMN IF NOT EXISTS status VARCHAR(30) DEFAULT 'SETTLED'"))
-
-            try:
-                await conn.execute(text("UPDATE tables SET table_number = 'Table 1' WHERE id IN (1, 4, 7, 9, 11)"))
-                await conn.execute(text("UPDATE tables SET table_number = 'Table 2' WHERE id IN (2, 5, 8, 10, 12)"))
-                await conn.execute(text("UPDATE tables SET table_number = 'Table 3' WHERE id IN (3, 6, 13)"))
-            except Exception:
-                pass
+            logger.info("Local SQLite database schema verified.")
+        else:
+            logger.info("PostgreSQL database detected. Schema migrations are managed exclusively by Alembic.")
 
         logger.info("Database schema initialized successfully.")
 

@@ -2,11 +2,14 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   async rewrites() {
-    const upstream = (process.env.API_UPSTREAM_URL || "https://cafe-piza-api.onrender.com").replace(/\/$/, "");
+    const upstream = (
+      process.env.API_UPSTREAM_URL ||
+      (process.env.NODE_ENV === "development" ? "http://localhost:8000" : "")
+    ).replace(/\/$/, "");
     return {
       beforeFiles: [],
       afterFiles: [],
-      fallback: [{ source: "/api/v1/:path*", destination: `${upstream}/api/v1/:path*` }],
+      fallback: upstream ? [{ source: "/api/v1/:path*", destination: `${upstream}/api/v1/:path*` }] : [],
     };
   },
   images: {
